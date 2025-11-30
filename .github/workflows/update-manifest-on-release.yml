@@ -1,0 +1,108 @@
+name: Update manifest.json on release
+
+on:
+  release:
+    types: [published]   # runs when you publish a release
+
+permissions:
+  contents: write        # needed to push manifest.json changes
+
+jobs:
+  update-manifest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Pick the .bin asset from this release
+      - name: Select firmware asset
+        id: select_asset
+        env:
+          RELEASE_JSON: ${{ toJson(github.event.release) }}
+        run: |
+          node << 'EOF'
+          const fs = require('fs');
+
+          const rel = JSON.parse(process.env.RELEASE_JSON || '{}');
+          const assets = rel.assets || [];
+          if (!assets.length) {
+            throw new Error("No assets found on this release.");
+          }
+
+          // Prefer *.ino.bin, fallback to *.bin
+          let asset = assets.find(a => a.name.endsWith('.ino.bin')) ||
+                      assets.find(a => a.name.endsWith('.bin'));
+
+          if (!asset) {
+            throw new Error("No .bin firmware asset found on this release.");
+          }
+
+          const out = process.env.GITHUB_OUTPUT;
+          fs.appendFileSync(out, `asset_url=${asset.browser_download_url}\n`);
+          fs.appendFileSync(out, `asset_name=${asset.name}\n`);
+          EOF
+
+      - name: Download firmware binary
+        env:
+          ASSET_URL: ${{ steps.select_asset.outputs.asset_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Downloading firmware from: $ASSET_URL"
+          curl -L \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            "$ASSET_URL" \
+            -o firmware.bin
+
+      - name: Compute size and SHA-256
+        id: hash
+        run: |
+          SIZE=$(stat -c%s firmware.bin)
+          SHA=$(sha256sum firmware.bin | cut -d' ' -f1)
+          echo "size=$SIZE"
+          echo "sha256=$SHA"
+          echo "size=$SIZE"   >> $GITHUB_OUTPUT
+          echo "sha256=$SHA"  >> $GITHUB_OUTPUT
+
+      - name: Update manifest.json
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          FW_URL:   ${{ steps.select_asset.outputs.asset_url }}
+          FW_SIZE:  ${{ steps.hash.outputs.size }}
+          FW_SHA:   ${{ steps.hash.outputs.sha256 }}
+        run: |
+          # Strip leading "v" from tag for the version field
+          VERSION="${TAG_NAME#v}"
+
+          cat > manifest.json <<EOF
+          {
+            "latestVersion": "${VERSION}",
+            "firmware": {
+              "url": "${FW_URL}",
+              "size": ${FW_SIZE},
+              "sha256": "${FW_SHA}"
+            }
+          }
+          EOF
+
+          echo "Updated manifest.json:"
+          cat manifest.json
+
+      - name: Commit and push manifest.json
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add manifest.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update manifest.json for ${TAG_NAME}"
+          git push
