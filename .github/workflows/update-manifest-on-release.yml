@@ -105,4 +105,6 @@ jobs:
           fi
 
           git commit -m "Update manifest.json for ${TAG_NAME}"
-          git push
+          git push origin HEAD:main
+
+          
