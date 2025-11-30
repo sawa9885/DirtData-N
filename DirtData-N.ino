@@ -1094,9 +1094,13 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
       LOG("[BLE] WiFi password updated (len=%u)\n", (unsigned)cfg.wifi_pass.length());
 
     } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef7"))) {
-      // Commit: app writes here when done; just restart
-      LOG("[BLE] Commit received, restarting...\n");
+      // Commit: app writes here when done; set RTC from BLE ISO (if present), then restart
+      LOG("[BLE] Commit received\n");
+      if (cfg.timestamp_iso.length()) {
+        setRtcFromIsoString(cfg.timestamp_iso);
+      }
       dumpCfgForDebug();
+      LOG("[BLE] Restarting after commit...\n");
       delay(200);
       esp_restart();
 
