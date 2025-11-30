@@ -20,15 +20,22 @@
  *               ESP_ADC_SEN   → microbial node
  *           - DS18B20 soil temperature
  *      * Pack everything into SensorData_t
- *      * Connect Wi-Fi
- *      * Grab NTP timestamp (UTC ISO) while Wi-Fi is up
- *      * Build ArcGIS payload from SensorData_t and POST once
+ *      * If Wi-Fi enabled:
+ *           - Connect Wi-Fi
+ *           - Grab NTP timestamp (UTC ISO) while Wi-Fi is up
+ *           - Build ArcGIS payload from SensorData_t and POST once
  *      * Log same SensorData_t as CSV row to /DirtData.csv on SD
+ *        if SD logging enabled
  *      * Deep sleep for cfg.interval_min minutes
  *
  * - DEBUG flag:
  *      DEBUG=1 → Serial + delay() in waits
  *      DEBUG=0 → no Serial + light sleep in waits
+ *
+ * - Time source priority:
+ *      1) NTP (if Wi-Fi enabled + connected)
+ *      2) RTC (seeded once from BLE ISO timestamp, then free-runs)
+ *      3) If neither valid → timestamp unset
  ************************************************************/
 
 #include <Arduino.h>
@@ -52,6 +59,7 @@
 #include <SPI.h>
 #include <SD.h>
 #include <time.h>
+#include <sys/time.h>
 
 #include <NimBLEDevice.h>
 #include <NimBLEAdvertising.h>
@@ -114,6 +122,13 @@ struct Config {
   uint32_t interval_min;
   String wifi_ssid;
   String wifi_pass;
+
+  // New:
+  String   timestamp_iso;        // BLE-provided ISO timestamp
+  bool     sd_enable;
+  bool     wifi_enable;
+  bool     ble_enable;
+  uint32_t ble_adv_interval_sec; // seconds
 } cfg;
 
 // ================== SNAPSHOTS & PAYLOAD =================
@@ -520,7 +535,7 @@ void buildSensorDataFromSnapshots(SensorData_t &d,
   memset(&d, 0, sizeof(d));
 
   d.nodeId = GetNodeIdFromMac();
-  d.timestampUtc[0] = '\0'; // filled later after NTP
+  d.timestampUtc[0] = '\0'; // filled later after time source
 
   d.latitude  = cfg.lat.length()? atof(cfg.lat.c_str()) : NAN;
   d.longitude = cfg.lon.length()? atof(cfg.lon.c_str()) : NAN;
@@ -717,10 +732,13 @@ bool connectWiFiSTA(const String& ssid, const String& pass, uint32_t timeoutMs=2
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid.c_str(), pass.c_str());
   uint32_t t0 = millis();
-  while (WiFi.status()!=WL_CONNECTED && millis()-t0<timeoutMs) delay(200);
-  return (WiFi.status()==WL_CONNECTED);
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) {
+    delay(200);
+  }
+  return (WiFi.status() == WL_CONNECTED);
 }
 
+// NTP: only called when Wi-Fi is enabled and connected
 bool fetchTimeUTC(char *out, size_t len) {
   // UTC
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
@@ -731,11 +749,56 @@ bool fetchTimeUTC(char *out, size_t len) {
   while (millis() - start < timeoutMs) {
     if (getLocalTime(&timeinfo, 1000)) {
       strftime(out, len, "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-      LOG("[Time] %s\n", out);
+      LOG("[Time] NTP: %s\n", out);
       return true;
     }
   }
   LOG("[ERROR] [Time] Failed to get NTP time\n");
+  if (len > 0) out[0] = '\0';
+  return false;
+}
+
+// Seed RTC from BLE ISO timestamp (used only if RTC looks uninitialized)
+bool setRtcFromIsoString(const String& iso) {
+  if (!iso.length()) return false;
+
+  int year, mon, day, hour, min, sec;
+  if (sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d",
+             &year, &mon, &day, &hour, &min, &sec) != 6) {
+    LOG("[Time] Invalid BLE ISO timestamp: %s\n", iso.c_str());
+    return false;
+  }
+
+  struct tm t{};
+  t.tm_year = year - 1900;
+  t.tm_mon  = mon - 1;
+  t.tm_mday = day;
+  t.tm_hour = hour;
+  t.tm_min  = min;
+  t.tm_sec  = sec;
+
+  time_t tt = mktime(&t); // with TZ=UTC, treat as UTC
+  if (tt == (time_t)-1) {
+    LOG("[Time] mktime failed for BLE ISO\n");
+    return false;
+  }
+
+  struct timeval tv;
+  tv.tv_sec  = tt;
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+  LOG("[Time] RTC set from BLE timestamp: %s\n", iso.c_str());
+  return true;
+}
+
+// Read current RTC time (no NTP, just RTC)
+bool readRtcTimeUTC(char *out, size_t len) {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 1000)) {
+    strftime(out, len, "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+    LOG("[Time] RTC: %s\n", out);
+    return true;
+  }
   if (len > 0) out[0] = '\0';
   return false;
 }
@@ -918,6 +981,14 @@ void loadPrefs() {
   if (cfg.interval_min == 0) cfg.interval_min = 30;
   cfg.wifi_ssid    = prefs.getString("wifi_ssid", "");
   cfg.wifi_pass    = prefs.getString("wifi_pass", "");
+
+  // New fields
+  cfg.timestamp_iso       = prefs.getString("ts_iso", "");
+  cfg.sd_enable           = prefs.getUChar("sd_en",   1);  // default SD ON
+  cfg.wifi_enable         = prefs.getUChar("wifi_en", 1);  // default Wi-Fi ON
+  cfg.ble_enable          = prefs.getUChar("ble_en",  0);  // default BLE periodic OFF
+  cfg.ble_adv_interval_sec= prefs.getUInt("ble_adv_sec", 30);
+  if (cfg.ble_adv_interval_sec == 0) cfg.ble_adv_interval_sec = 30;
 }
 
 // ================== BLE CALLBACKS =================
@@ -949,6 +1020,11 @@ void dumpCfgForDebug() {
   LOG("  SSID       : '%s'\n", cfg.wifi_ssid.c_str());
   LOG("  Pass set   : %s\n", cfg.wifi_pass.length() ? "YES":"NO");
   LOG("  Interval   : %u min\n", (unsigned)cfg.interval_min);
+  LOG("  ts_iso     : '%s'\n", cfg.timestamp_iso.c_str());
+  LOG("  SD enable  : %s\n", cfg.sd_enable   ? "ON" : "OFF");
+  LOG("  WiFi enable: %s\n", cfg.wifi_enable ? "ON" : "OFF");
+  LOG("  BLE enable : %s\n", cfg.ble_enable  ? "ON" : "OFF");
+  LOG("  BLE adv s  : %u\n", (unsigned)cfg.ble_adv_interval_sec);
 }
 
 class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
@@ -1023,6 +1099,50 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
       dumpCfgForDebug();
       delay(200);
       esp_restart();
+
+    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef8"))) {
+      // Timestamp ISO string
+      cfg.timestamp_iso = makeString(value);
+      prefs.putString("ts_iso", cfg.timestamp_iso);
+      LOG("[BLE] Timestamp ISO updated: %s\n", cfg.timestamp_iso.c_str());
+
+    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef9"))) {
+      // SD enable: 1 byte 0/1
+      bool en = (value.size() >= 1 && value[0] != 0);
+      cfg.sd_enable = en;
+      prefs.putUChar("sd_en", en ? 1 : 0);
+      LOG("[BLE] SD enable: %s\n", en ? "ON" : "OFF");
+
+    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdefa"))) {
+      // Wi-Fi enable: 1 byte 0/1
+      bool en = (value.size() >= 1 && value[0] != 0);
+      cfg.wifi_enable = en;
+      prefs.putUChar("wifi_en", en ? 1 : 0);
+      LOG("[BLE] WiFi enable: %s\n", en ? "ON" : "OFF");
+
+    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdefb"))) {
+      // BLE enable: 1 byte 0/1
+      bool en = (value.size() >= 1 && value[0] != 0);
+      cfg.ble_enable = en;
+      prefs.putUChar("ble_en", en ? 1 : 0);
+      LOG("[BLE] BLE enable: %s\n", en ? "ON" : "OFF");
+
+    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdefc"))) {
+      // BLE advertising interval, uint32 LE seconds (min 1)
+      if (value.size() >= 4) {
+        uint32_t v =
+          (uint8_t)value[0] |
+          ((uint8_t)value[1] << 8) |
+          ((uint8_t)value[2] << 16) |
+          ((uint8_t)value[3] << 24);
+
+        if (v == 0) v = 1;
+        cfg.ble_adv_interval_sec = v;
+        prefs.putUInt("ble_adv_sec", cfg.ble_adv_interval_sec);
+        LOG("[BLE] Adv interval updated: %u s\n", (unsigned)cfg.ble_adv_interval_sec);
+      } else {
+        LOG("[BLE] Adv interval write too small (%u bytes)\n", (unsigned)value.size());
+      }
     }
   }
 };
@@ -1066,6 +1186,18 @@ void RunBleSetupSession() {
   g_charCommit   = mkChar("12345678-1234-5678-1234-56789abcdef7",
                           NIMBLE_PROPERTY::WRITE);
 
+  // New characteristics
+  auto* c_tsIso   = mkChar("12345678-1234-5678-1234-56789abcdef8",
+                           NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  auto* c_sdEn    = mkChar("12345678-1234-5678-1234-56789abcdef9",
+                           NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  auto* c_wifiEn  = mkChar("12345678-1234-5678-1234-56789abcdefa",
+                           NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  auto* c_bleEn   = mkChar("12345678-1234-5678-1234-56789abcdefb",
+                           NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  auto* c_bleInt  = mkChar("12345678-1234-5678-1234-56789abcdefc",
+                           NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+
   // Seed values
   g_charNickname->setValue(cfg.nickname.c_str());
   g_charLat->setValue(cfg.lat.c_str());
@@ -1083,9 +1215,34 @@ void RunBleSetupSession() {
   g_charSsid->setValue(cfg.wifi_ssid.c_str());
   g_charPass->setValue(cfg.wifi_pass.c_str());
 
+  c_tsIso->setValue(cfg.timestamp_iso.c_str());
+
+  {
+    uint8_t b = cfg.sd_enable ? 1 : 0;
+    c_sdEn->setValue(&b, 1);
+  }
+  {
+    uint8_t b = cfg.wifi_enable ? 1 : 0;
+    c_wifiEn->setValue(&b, 1);
+  }
+  {
+    uint8_t b = cfg.ble_enable ? 1 : 0;
+    c_bleEn->setValue(&b, 1);
+  }
+  {
+    uint32_t v = cfg.ble_adv_interval_sec ? cfg.ble_adv_interval_sec : 30;
+    uint8_t buf[4] = {
+      (uint8_t)(v & 0xFF),
+      (uint8_t)((v >> 8) & 0xFF),
+      (uint8_t)((v >> 16) & 0xFF),
+      (uint8_t)((v >> 24) & 0xFF)
+    };
+    c_bleInt->setValue(buf, 4);
+  }
+
   svc->start();
 
-  // Advertising + scan response (this API DOES exist on your core)
+  // Advertising + scan response
   NimBLEAdvertisementData advData;
   NimBLEAdvertisementData scanData;
 
@@ -1121,6 +1278,10 @@ void setup() {
   delay(1000);  // 1s after boot for USB to settle
 #endif
 
+  // Force everything to be treated as UTC
+  setenv("TZ", "UTC0", 1);
+  tzset();
+
   esp_log_level_set("i2c", ESP_LOG_NONE);
 
   LOG("\n[Setup] Booting\n");
@@ -1141,11 +1302,26 @@ void setup() {
   // Load config
   loadPrefs();
 
-  // If BOOT held at boot: enter BLE setup mode instead of sampling
+  LOG("[Setup] SD=%s WiFi=%s BLE=%s AdvInt=%u s\n",
+      cfg.sd_enable   ? "ON" : "OFF",
+      cfg.wifi_enable ? "ON" : "OFF",
+      cfg.ble_enable  ? "ON" : "OFF",
+      (unsigned)cfg.ble_adv_interval_sec);
+
+  // BLE setup mode?
   if (bootButtonHeld()) {
     LOG("[Setup] BOOT held — entering BLE setup mode\n");
     RunBleSetupSession();
-    // RunBleSetupSession never returns (esp_restart() on disconnect/commit)
+    // never returns (esp_restart on disconnect/commit)
+  }
+
+  // If RTC looks uninitialized, seed it ONCE from BLE ISO timestamp (if present)
+  {
+    time_t now = time(nullptr);
+    const time_t cutoff = 1609459200L; // 2021-01-01
+    if (now < cutoff && cfg.timestamp_iso.length()) {
+      setRtcFromIsoString(cfg.timestamp_iso);
+    }
   }
 
   LOG("[Setup] Complete — starting measurement\n");
@@ -1188,30 +1364,53 @@ void setup() {
                                esp_micro_mV,
                                soilTempC);
 
-  // Init SD once (if card present)
-  initSD();
-
-  // Wi-Fi / Time
+  // -------- Wi-Fi connect (gated by wifi_enable flag) --------
   bool wifi_ok = false;
-  if (!cfg.wifi_ssid.length()) {
+  if (!cfg.wifi_enable) {
+    LOG("[Cloud] Wi-Fi disabled by config\n");
+  } else if (!cfg.wifi_ssid.length()) {
     LOG("[ERROR] [Cloud] No Wi-Fi configured\n");
   } else {
     wifi_ok = connectWiFiSTA(cfg.wifi_ssid, cfg.wifi_pass);
     if (!wifi_ok) {
       LOG("[ERROR] [Cloud] Wi-Fi connect failed\n");
+    }
+  }
+
+  // -------- Timestamp selection ----------
+  // 1) If Wi-Fi is enabled AND connected, try NTP (updates RTC).
+  // 2) Otherwise, use current RTC time (which may have been set by BLE or earlier NTP).
+  // 3) If RTC invalid, leave unset.
+  bool gotTime = false;
+  if (cfg.wifi_enable && wifi_ok) {
+    gotTime = fetchTimeUTC(sample.timestampUtc, sizeof(sample.timestampUtc));
+    if (gotTime) {
+      LOG("[Time] Using NTP timestamp\n");
+    }
+  }
+  if (!gotTime) {
+    if (readRtcTimeUTC(sample.timestampUtc, sizeof(sample.timestampUtc))) {
+      LOG("[Time] Using RTC-only timestamp\n");
+      gotTime = true;
     } else {
-      fetchTimeUTC(sample.timestampUtc, sizeof(sample.timestampUtc));
+      sample.timestampUtc[0] = '\0';
+      LOG("[Time] No valid time (no NTP, RTC invalid)\n");
     }
   }
 
   // Payload logging (after timestamp attempt)
   logPayload(sample);
 
-  // SD log (with whatever timestamp we have)
-  sdAppendSample(sample);
+  // -------- SD log (with whatever timestamp we have), gated by SD flag --------
+  if (cfg.sd_enable) {
+    initSD();
+    sdAppendSample(sample);
+  } else {
+    LOG("[SD] SD logging disabled by config\n");
+  }
 
-  // Cloud upload
-  if (wifi_ok) {
+  // -------- Cloud upload (gated by wifi_enable flag) --------
+  if (cfg.wifi_enable && wifi_ok) {
     String cloudErr;
     bool ok = UploadToCloudOnce(sample, cloudErr);
     if (ok) {
@@ -1221,6 +1420,14 @@ void setup() {
     } else {
       LOG("[ERROR] [Cloud] Unknown upload failure\n");
     }
+  }
+
+  // -------- BLE periodic advertising stub --------
+  if (cfg.ble_enable) {
+    LOG("[BLE] (stub) Periodic advertising ENABLED, interval=%u s\n",
+        (unsigned)cfg.ble_adv_interval_sec);
+  } else {
+    LOG("[BLE] (stub) Periodic BLE advertising DISABLED\n");
   }
 
   // Cleanly stop SCD before cutting power
