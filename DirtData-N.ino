@@ -1,8 +1,8 @@
 /************************************************************
  * DirtData Node (ESP32-C6, Arduino core)
  * ----------------------------------------------------------
- * - Captive-portal Setup Wizard (SoftAP + WebServer + DNS)
- * - One-shot run:
+ * - BLE Setup Mode (hold BOOT at boot to enter)
+ * - Normal one-shot run (on each wakeup):
  *      * Power sensor rail
  *      * Init I2C, SCD4x (robust, avoid-NACK), ADS1115
  *      * WAIT for SCD4x data-ready (getDataReadyStatus +
@@ -34,8 +34,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Wire.h>
-#include <WebServer.h>
-#include <DNSServer.h>
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -54,6 +52,10 @@
 #include <SPI.h>
 #include <SD.h>
 #include <time.h>
+
+#include <NimBLEDevice.h>
+#include <NimBLEAdvertising.h>
+#include <NimBLEAdvertisementData.h>
 
 // ================== DEBUG ==================
 #define DEBUG 1
@@ -184,13 +186,18 @@ float g_ads_v3v3 = NAN;  // for ESP resistance calc
 OneWireNg_CurrentPlatform oneWire(ESP_TEMP, false);
 DSTherm tempSensor(oneWire);
 
-// Wizard / server
-WebServer server(80);
-DNSServer dns;
-const byte DNS_PORT = 53;
-
 // SD
 bool g_sd_ok = false;
+
+// BLE globals
+static bool g_bleClientConnected = false;
+static NimBLECharacteristic* g_charNickname = nullptr;
+static NimBLECharacteristic* g_charLat      = nullptr;
+static NimBLECharacteristic* g_charLon      = nullptr;
+static NimBLECharacteristic* g_charInterval = nullptr;
+static NimBLECharacteristic* g_charSsid     = nullptr;
+static NimBLECharacteristic* g_charPass     = nullptr;
+static NimBLECharacteristic* g_charCommit   = nullptr;
 
 // ================== DEBUG SLEEP HELPER =================
 void lowPowerWaitMs(uint32_t ms) {
@@ -250,388 +257,28 @@ int32_t GetNodeIdFromMac() {
 }
 
 static String macLast4() {
-  uint8_t mac[6]; WiFi.macAddress(mac);
-  char buf[5]; snprintf(buf, sizeof(buf), "%02X%02X", mac[4], mac[5]);
+  uint64_t mac = ESP.getEfuseMac(); // 48-bit base MAC in eFuse
+  uint8_t b[6];
+  for (int i = 0; i < 6; ++i) {
+    b[i] = (mac >> (8 * i)) & 0xFF;  // little-endian order
+  }
+  char buf[5];
+  snprintf(buf, sizeof(buf), "%02X%02X", b[4], b[5]);
   return String(buf);
 }
+
 static String macStr() {
-  uint8_t mac[6]; WiFi.macAddress(mac);
+  uint64_t mac = ESP.getEfuseMac();
+  uint8_t b[6];
+  for (int i = 0; i < 6; ++i) {
+    b[i] = (mac >> (8 * i)) & 0xFF;
+  }
   char buf[18];
   snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
-           mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+           b[0], b[1], b[2], b[3], b[4], b[5]);
   return String(buf);
 }
 
-// ================== HTML/WIZARD =================
-static String fmtCoord(double v, int decimals = 6) {
-  char buf[32]; dtostrf(v, 0, decimals, buf); return String(buf);
-}
-
-String iosHead(const char* title) {
-  String css; css.reserve(2600);
-  css += F(
-"<!doctype html><html lang=\"en\"><head>\n"
-"<meta charset=\"utf-8\">\n"
-"<meta name=\"viewport\" content=\"viewport-fit=cover,width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no\">\n"
-"<title>");
-  css += title;
-  css += F(
-"</title>\n"
-"<style>\n"
-":root{--blue:#0A84FF;--text:#0A0A0A;--muted:#6E6E73;--bg:#fff;--card:#fff;--shadow:0 6px 24px rgba(0,0,0,.08);--radius:16px}\n"
-"*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}\n"
-"html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font:16px -apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,Inter,Helvetica,Arial,sans-serif}\n"
-".safe{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}\n"
-".wrap{min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:24px}\n"
-".card{max-width:720px;width:100%;background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:28px}\n"
-".title{font-size:28px;font-weight:700;letter-spacing:-.02em;margin:4px 0 8px}\n"
-".subtitle{font-size:15px;color:#6E6E73;margin:0 0 18px}\n"
-".brand{display:flex;align-items:center;gap:10px;margin-bottom:8px}\n"
-".chip{display:inline-block;padding:6px 10px;border-radius:999px;background:#E6F0FF;color:#003EAA;font-weight:600;font-size:12px;letter-spacing:.02em}\n"
-".hero{margin:16px 0 20px;line-height:1.6}\n"
-".row{display:flex;flex-direction:column;gap:10px;margin:12px 0}\n"
-".label{font-size:13px;color:#6E6E73;margin-bottom:2px}\n"
-".input,.button{width:100%;border-radius:14px;padding:14px 16px;font-size:16px;border:1px solid #E5E5EA;background:#fff;outline:none}\n"
-".input:focus{border-color:#0A84FF;box-shadow:0 0 0 3px rgba(10,132,255,.15)}\n"
-".actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px}\n"
-".btn{appearance:none;border:0;border-radius:14px;padding:14px 18px;font-weight:700;font-size:16px;letter-spacing:.2px;text-decoration:none;display:inline-flex;align-items:center;gap:8px;cursor:pointer}\n"
-".btn-primary{background:var(--blue);color:#fff;box-shadow:0 4px 12px rgba(10,132,255,.35)}\n"
-".btn-secondary{background:#EEF2FF;color:#103D98}\n"
-".btn-link{background:transparent;color:#0A84FF;padding:10px 0}\n"
-".small{font-size:13px;color:#6E6E73}\n"
-".meta{margin-top:14px;font-size:12px;color:var(--muted)}\n"
-".footer{margin-top:14px;font-size:12px;color:var(--muted)}\n"
-".badge{display:inline-block;background:#FFF7E6;color:#8A5200;border:1px solid #FFE1A6;border-radius:999px;padding:4px 8px;font-size:12px}\n"
-".err{color:#B00020;font-size:13px;margin-top:6px}\n"
-".ok{color:#007A0A;font-size:13px;margin-top:6px}\n"
-"</style>\n"
-"</head><body><div class=\"safe wrap\"><main class=\"card\">\n"
-"<div class=\"brand\">\n"
-"  <svg width=\"28\" height=\"28\" viewBox=\"0 0 24 24\" fill=\"none\" aria-hidden=\"true\">\n"
-"    <rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"6\" fill=\"#0A84FF\"/>\n"
-"    <path d=\"M8.2 12.4c2.1-2.6 5.5-2.6 7.6 0\" stroke=\"#fff\" stroke-width=\"2\" stroke-linecap=\"round\"/>\n"
-"    <circle cx=\"8.8\" cy=\"13.8\" r=\"1.2\" fill=\"#fff\"/>\n"
-"    <circle cx=\"15.2\" cy=\"13.8\" r=\"1.2\" fill=\"#fff\"/>\n"
-"  </svg>\n"
-"  <span class=\"chip\">DirtData</span>\n"
-"</div>\n");
-  return css;
-}
-
-String iosFoot(const String& meta) {
-  String f; f.reserve(600);
-  f += F("<div class=\"meta\">");
-  f += meta;
-  f += F("</div><div class=\"footer\">© ");
-  f += String(__DATE__);
-  f += F(" DirtData • All rights reserved</div></main></div></body></html>");
-  return f;
-}
-
-String pageWelcome() {
-  String html; html.reserve(6000);
-  html += iosHead("DirtData • Welcome");
-  html += F(
-"<h1 class=\"title\">Welcome — thanks for choosing DirtData!</h1>\n"
-"<p class=\"subtitle\">Setup • Page 1 of 5</p>\n"
-"<p class=\"hero\">This wizard configures your node name, location, upload interval, and Wi-Fi connection.</p>\n"
-"<div class=\"actions\"><a class=\"btn btn-primary\" href=\"/device-name\">Get Started</a></div>\n");
-  String meta = "SSID: <b>DirtData-Setup-" + macLast4() + "</b> • Device ID: <b>" + macStr() + "</b>";
-  html += iosFoot(meta);
-  return html;
-}
-
-String pageDeviceName() {
-  String html; html.reserve(7000);
-  html += iosHead("DirtData • Device Name & ID");
-  html += F(
-"<a class=\"btn btn-link\" href=\"/\">← Back</a>\n"
-"<h1 class=\"title\">Name your device</h1>\n"
-"<p class=\"subtitle\">Setup • Page 2 of 5</p>\n"
-"<form method=\"POST\" action=\"/device-name\" autocomplete=\"on\">\n"
-"  <fieldset class=\"row\">\n"
-"    <label class=\"label\" for=\"nickname\">Device Nickname</label>\n"
-"    <input class=\"input\" id=\"nickname\" name=\"nickname\" type=\"text\" minlength=\"1\" maxlength=\"40\"\n"
-"           placeholder=\"e.g., North Plot Node\" value=\"");
-  html += cfg.nickname;
-  html += F("\" required>\n"
-"    <span class=\"small\">You can change this later.</span>\n"
-"  </fieldset>\n"
-"  <div class=\"actions\">\n"
-"    <button class=\"btn btn-secondary\" type=\"button\" onclick=\"history.back()\">Back</button>\n"
-"    <button class=\"btn btn-primary\" type=\"submit\">Continue</button>\n"
-"  </div>\n"
-"</form>\n");
-  html += iosFoot("Device ID: <b>" + macStr() + "</b>");
-  return html;
-}
-
-String pageDeviceLocation() {
-  String html; html.reserve(12000);
-  html += iosHead("DirtData • Device Location");
-  html += F(
-"<a class=\"btn btn-link\" href=\"/device-name\">← Back</a>\n"
-"<h1 class=\"title\">Device location</h1>\n"
-"<p class=\"subtitle\">Setup • Page 3 of 5</p>\n"
-"<div id=\"gpsWarn\" class=\"small\" style=\"display:none\"><span class=\"badge\">Note</span> Your browser may block GPS on captive/HTTP pages. If the button does nothing, enter coordinates manually.</div>\n"
-"<div class=\"actions\"><button class=\"btn btn-secondary\" type=\"button\" id=\"useGPS\">Use phone GPS</button></div>\n"
-"<form id=\"locform\" method=\"POST\" action=\"/device-location\" autocomplete=\"on\" novalidate>\n"
-"  <fieldset class=\"row\">\n"
-"    <label class=\"label\" for=\"lat\">Latitude (−90..90)</label>\n"
-"    <input class=\"input\" id=\"lat\" name=\"lat\" type=\"text\" inputmode=\"text\" placeholder=\"40.014990\" value=\"");
-  html += cfg.lat;
-  html += F("\" required>\n"
-"    <div id=\"latErr\" class=\"err\" style=\"display:none\">Enter a latitude between −90 and 90.</div>\n"
-"  </fieldset>\n"
-"  <fieldset class=\"row\">\n"
-"    <label class=\"label\" for=\"lon\">Longitude (−180..180)</label>\n"
-"    <input class=\"input\" id=\"lon\" name=\"lon\" type=\"text\" inputmode=\"text\" placeholder=\"-105.270550\" value=\"");
-  html += cfg.lon;
-  html += F("\" required>\n"
-"    <div id=\"lonErr\" class=\"err\" style=\"display:none\">Enter a longitude between −180 and 180.</div>\n"
-"  </fieldset>\n"
-"  <div class=\"actions\">\n"
-"    <button class=\"btn btn-secondary\" type=\"button\" onclick=\"history.back()\">Back</button>\n"
-"    <button class=\"btn btn-primary\" type=\"submit\">Continue</button>\n"
-"  </div>\n"
-"</form>\n"
-"<script>\n"
-"(function(){ if(!window.isSecureContext){ document.getElementById('gpsWarn').style.display='block'; } })();\n"
-"(function(){\n"
-"  const btn=document.getElementById('useGPS'); const lat=document.getElementById('lat'); const lon=document.getElementById('lon');\n"
-"  if(!btn) return;\n"
-"  btn.addEventListener('click',function(){\n"
-"    if(!('geolocation' in navigator)){ alert('Geolocation not supported.'); return; }\n"
-"    const old=btn.textContent; btn.disabled=true; btn.textContent='Getting location…';\n"
-"    navigator.geolocation.getCurrentPosition(function(pos){\n"
-"      lat.value=pos.coords.latitude.toFixed(6);\n"
-"      lon.value=pos.coords.longitude.toFixed(6);\n"
-"      btn.textContent=old; btn.disabled=false;\n"
-"    },function(err){\n"
-"      alert('Could not get GPS; please enter manually.');\n"
-"      btn.textContent=old; btn.disabled=false;\n"
-"    },{enableHighAccuracy:true,timeout:15000,maximumAge:0});\n"
-"  });\n"
-"})();\n"
-"(function(){\n"
-"  const form=document.getElementById('locform'), lat=document.getElementById('lat'), lon=document.getElementById('lon');\n"
-"  const latErr=document.getElementById('latErr'), lonErr=document.getElementById('lonErr');\n"
-"  function vLat(v){const x=parseFloat(v);return isFinite(x)&&x>=-90&&x<=90;}\n"
-"  function vLon(v){const x=parseFloat(v);return isFinite(x)&&x>=-180&&x<=180;}\n"
-"  form.addEventListener('submit',function(e){\n"
-"    let ok=true; if(!vLat(lat.value)){latErr.style.display='block';ok=false;} else latErr.style.display='none';\n"
-"    if(!vLon(lon.value)){lonErr.style.display='block';ok=false;} else lonErr.style.display='none';\n"
-"    if(!ok)e.preventDefault();\n"
-"  });\n"
-"})();\n"
-"</script>\n");
-  html += iosFoot("Device ID: <b>" + macStr() + "</b>");
-  return html;
-}
-
-String pageAdvancedOptions() {
-  String html; html.reserve(8000);
-  html += iosHead("DirtData • Advanced Options");
-  html += F(
-"<a class=\"btn btn-link\" href=\"/device-location\">← Back</a>\n"
-"<h1 class=\"title\">Advanced options</h1>\n"
-"<p class=\"subtitle\">Setup • Page 4 of 5</p>\n"
-"<form method=\"POST\" action=\"/advanced-options\" autocomplete=\"on\">\n"
-"  <fieldset class=\"row\">\n"
-"    <label class=\"label\" for=\"interval\">Interval (minutes)</label>\n"
-"    <input class=\"input\" id=\"interval\" name=\"interval\" type=\"number\" inputmode=\"numeric\" step=\"1\" min=\"1\" max=\"10080\"\n"
-"           placeholder=\"30\" value=\"");
-  html += String(cfg.interval_min);
-  html += F("\" required>\n"
-"    <span class=\"small\">More frequent readings reduce battery life.</span>\n"
-"  </fieldset>\n"
-"  <div class=\"actions\">\n"
-"    <button class=\"btn btn-secondary\" type=\"button\" onclick=\"history.back()\">Back</button>\n"
-"    <button class=\"btn btn-primary\" type=\"submit\">Continue</button>\n"
-"  </div>\n"
-"</form>\n");
-  html += iosFoot("Device ID: <b>" + macStr() + "</b>");
-  return html;
-}
-
-String pageWifiCreds(const String& statusMsg = "", bool ok=false) {
-  String html; html.reserve(9000);
-  html += iosHead("DirtData • Wi-Fi");
-  html += F(
-"<a class=\"btn btn-link\" href=\"/advanced-options\">← Back</a>\n"
-"<h1 class=\"title\">Wi-Fi credentials</h1>\n"
-"<p class=\"subtitle\">Setup • Page 5 of 5</p>\n"
-"<form method=\"POST\" action=\"/wifi\" autocomplete=\"on\">\n"
-"  <fieldset class=\"row\">\n"
-"    <label class=\"label\" for=\"ssid\">SSID</label>\n"
-"    <input class=\"input\" id=\"ssid\" name=\"ssid\" type=\"text\" minlength=\"1\" maxlength=\"64\"\n"
-"           placeholder=\"Your Wi-Fi name\" value=\"");
-  html += cfg.wifi_ssid;
-  html += F("\" required>\n"
-"  </fieldset>\n"
-"  <fieldset class=\"row\">\n"
-"    <label class=\"label\" for=\"pass\">Password</label>\n"
-"    <input class=\"input\" id=\"pass\" name=\"pass\" type=\"password\" maxlength=\"64\"\n"
-"           placeholder=\"Your Wi-Fi password\" value=\"");
-  html += cfg.wifi_pass;
-  html += F("\">\n"
-"  </fieldset>\n"
-"  <div class=\"actions\">\n"
-"    <button class=\"btn btn-secondary\" type=\"button\" onclick=\"history.back()\">Back</button>\n"
-"    <button class=\"btn btn-primary\" type=\"submit\">Test & Save</button>\n"
-"  </div>\n"
-"</form>\n");
-  if (statusMsg.length()) {
-    html += String("<div class=\"") + (ok?"ok":"err") + "\">" + statusMsg + "</div>";
-  }
-  html += iosFoot("Device ID: <b>" + macStr() + "</b>");
-  return html;
-}
-
-String pageSaved() {
-  String html; html.reserve(6000);
-  html += iosHead("DirtData • Setup Saved");
-  html += F(
-"<h1 class=\"title\">Setup saved</h1>\n"
-"<p class=\"subtitle\">You're good to go. You may close this page.</p>\n"
-"<div class=\"hero\">\n");
-  html += "Nickname: <b>" + (cfg.nickname.length()?cfg.nickname:String("(none)")) + "</b><br>";
-  html += "Location: <b>" + (cfg.lat.length()?cfg.lat:String("(lat?)")) + ", " +
-          (cfg.lon.length()?cfg.lon:String("(lon?)")) + "</b><br>";
-  html += "Interval: <b>" + String(cfg.interval_min) + " min</b><br>";
-  html += "Connection: <b>Direct Wi-Fi</b>";
-  html += F(
-"</div>\n"
-"<div class=\"actions\"><a class=\"btn btn-primary\" href=\"/\">Finish</a></div>\n");
-  html += iosFoot("Device ID: <b>" + macStr() + "</b>");
-  return html;
-}
-
-// HTTP handlers
-void handleRoot() { server.send(200, "text/html; charset=utf-8", pageWelcome()); }
-void handleGetDeviceName() { server.send(200, "text/html; charset=utf-8", pageDeviceName()); }
-void handlePostDeviceName() {
-  if (server.hasArg("nickname")) {
-    String v = server.arg("nickname");
-    if (v.length() > 40) v.remove(40);
-    cfg.nickname = v;
-    prefs.putString("nickname", cfg.nickname);
-  }
-  server.sendHeader("Location", "/device-location", true);
-  server.send(303, "text/plain", "");
-}
-
-static String clampCoordStr(const String& s, float lo, float hi) {
-  double x = atof(s.c_str());
-  if (isnan(x) || isinf(x)) return String("");
-  if (x < lo) x = lo;
-  if (x > hi) x = hi;
-  return fmtCoord(x, 6);
-}
-void handleGetDeviceLocation() { server.send(200, "text/html; charset=utf-8", pageDeviceLocation()); }
-void handlePostDeviceLocation() {
-  if (server.hasArg("lat")) { cfg.lat = clampCoordStr(server.arg("lat"), -90, 90); prefs.putString("lat", cfg.lat); }
-  if (server.hasArg("lon")) { cfg.lon = clampCoordStr(server.arg("lon"), -180, 180); prefs.putString("lon", cfg.lon); }
-  server.sendHeader("Location", "/advanced-options", true);
-  server.send(303, "text/plain", "");
-}
-
-void handleGetAdvancedOptions() { server.send(200, "text/html; charset=utf-8", pageAdvancedOptions()); }
-void handlePostAdvancedOptions() {
-  if (server.hasArg("interval")) {
-    long v = server.arg("interval").toInt();
-    if (v < 1) v = 1;
-    if (v > 10080) v = 10080;
-    cfg.interval_min = (uint32_t)v;
-    prefs.putUInt("interval_min", cfg.interval_min);
-  }
-  server.sendHeader("Location", "/wifi", true);
-  server.send(303, "text/plain", "");
-}
-
-void handleGetWifi() { server.send(200, "text/html; charset=utf-8", pageWifiCreds()); }
-bool testStaJoin(const String& ssid, const String& pass, uint32_t timeoutMs=15000) {
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.begin(ssid.c_str(), pass.c_str());
-  uint32_t t0 = millis();
-  while (WiFi.status()!=WL_CONNECTED && millis()-t0<timeoutMs) delay(200);
-  bool ok = (WiFi.status()==WL_CONNECTED);
-  WiFi.disconnect(true, true);
-  WiFi.mode(WIFI_AP);
-  return ok;
-}
-void handlePostWifi() {
-  String ssid = server.hasArg("ssid") ? server.arg("ssid") : "";
-  String pass = server.hasArg("pass") ? server.arg("pass") : "";
-  ssid.trim(); pass.trim();
-
-  if (!ssid.length()) {
-    server.send(200, "text/html; charset=utf-8", pageWifiCreds("SSID is required.", false));
-    return;
-  }
-
-  bool ok = testStaJoin(ssid, pass);
-  if (ok) {
-    cfg.wifi_ssid = ssid;
-    cfg.wifi_pass = pass;
-    prefs.putString("wifi_ssid", cfg.wifi_ssid);
-    prefs.putString("wifi_pass", cfg.wifi_pass);
-    server.send(200, "text/html; charset=utf-8", pageSaved());
-  } else {
-    server.send(200, "text/html; charset=utf-8",
-                pageWifiCreds("Could not join that Wi-Fi. Check SSID/password and try again.", false));
-  }
-}
-
-// Captive portal helpers
-void handleRedirectToRoot() { server.sendHeader("Location", "/", true); server.send(302, "text/plain", ""); }
-void handleAppleCaptive()   { server.sendHeader("Location", "/", true); server.send(200, "text/html", "<meta http-equiv='refresh' content='0; url=/'/>"); }
-void handleAndroidCaptive() { server.sendHeader("Location", "/", true); server.send(200, "text/html", "<meta http-equiv='refresh' content='0; url=/'/>"); }
-void handleWindowsCaptive() { server.sendHeader("Location", "/", true); server.send(200, "text/html", "<meta http-equiv='refresh' content='0; url=/'/>"); }
-
-void startAP() {
-  WiFi.setSleep(false);
-  WiFi.mode(WIFI_AP);
-  String ssid = "DirtData-Setup-" + macLast4();
-  WiFi.softAP(ssid.c_str(), nullptr, 6, 0, 4);
-}
-
-void startDNS() {
-  IPAddress apIP = WiFi.softAPIP();
-  dns.start(DNS_PORT, "*", apIP);
-}
-
-void startHTTP() {
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/device-name", HTTP_GET, handleGetDeviceName);
-  server.on("/device-name", HTTP_POST, handlePostDeviceName);
-  server.on("/device-location", HTTP_GET, handleGetDeviceLocation);
-  server.on("/device-location", HTTP_POST, handlePostDeviceLocation);
-  server.on("/advanced-options", HTTP_GET, handleGetAdvancedOptions);
-  server.on("/advanced-options", HTTP_POST, handlePostAdvancedOptions);
-  server.on("/wifi", HTTP_GET, handleGetWifi);
-  server.on("/wifi", HTTP_POST, handlePostWifi);
-
-  server.on("/hotspot-detect.html", HTTP_GET, handleAppleCaptive);
-  server.on("/generate_204", HTTP_GET, handleAndroidCaptive);
-  server.on("/gen_204", HTTP_GET, handleAndroidCaptive);
-  server.on("/ncsi.txt", HTTP_GET, handleWindowsCaptive);
-  server.on("/connecttest.txt", HTTP_GET, handleWindowsCaptive);
-  server.on("/fwlink", HTTP_GET, handleWindowsCaptive);
-
-  server.onNotFound(handleRedirectToRoot);
-  server.begin();
-}
-
-void loadPrefs() {
-  prefs.begin("dirtdata", false);
-  cfg.nickname     = prefs.getString("nickname", "");
-  cfg.lat          = prefs.getString("lat", "");
-  cfg.lon          = prefs.getString("lon", "");
-  cfg.interval_min = prefs.getUInt("interval_min", 30);
-  cfg.wifi_ssid    = prefs.getString("wifi_ssid", "");
-  cfg.wifi_pass    = prefs.getString("wifi_pass", "");
-}
 
 // ================== JSON HELPERS =================
 static inline void setOrNullF(JsonObject obj, const char* key, float value, bool ok) {
@@ -1261,17 +908,210 @@ void SleepMinutes(uint32_t minutes) {
   esp_deep_sleep_start();
 }
 
+// ================== CONFIG LOAD =================
+void loadPrefs() {
+  prefs.begin("dirtdata", false);
+  cfg.nickname     = prefs.getString("nickname", "");
+  cfg.lat          = prefs.getString("lat", "");
+  cfg.lon          = prefs.getString("lon", "");
+  cfg.interval_min = prefs.getUInt("interval_min", 30);
+  if (cfg.interval_min == 0) cfg.interval_min = 30;
+  cfg.wifi_ssid    = prefs.getString("wifi_ssid", "");
+  cfg.wifi_pass    = prefs.getString("wifi_pass", "");
+}
+
+// ================== BLE CALLBACKS =================
+class MyServerCallbacks : public NimBLEServerCallbacks {
+ public:
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+    (void)pServer;
+    (void)connInfo;
+    LOG("[BLE] Client connected\n");
+    g_bleClientConnected = true;
+  }
+
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+    (void)pServer;
+    (void)connInfo;
+    LOG("[BLE] Client disconnected, reason=%d\n", reason);
+    g_bleClientConnected = false;
+    LOG("[BLE] Restarting after disconnect\n");
+    delay(200);
+    esp_restart();
+  }
+};
+
+void dumpCfgForDebug() {
+  LOG("[CFG] Dump (after BLE write):\n");
+  LOG("  Nickname   : '%s'\n", cfg.nickname.c_str());
+  LOG("  Lat        : '%s'\n", cfg.lat.c_str());
+  LOG("  Lon        : '%s'\n", cfg.lon.c_str());
+  LOG("  SSID       : '%s'\n", cfg.wifi_ssid.c_str());
+  LOG("  Pass set   : %s\n", cfg.wifi_pass.length() ? "YES":"NO");
+  LOG("  Interval   : %u min\n", (unsigned)cfg.interval_min);
+}
+
+class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
+    (void)connInfo;
+
+    std::string value = c->getValue();
+    NimBLEUUID uuid = c->getUUID();
+
+    LOG("[BLE] onWrite: char=%s, len=%u\n",
+        uuid.toString().c_str(), (unsigned)value.size());
+
+    auto makeString = [&](const std::string& v) -> String {
+      char buf[96];
+      size_t n = v.size();
+      if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+      memcpy(buf, v.data(), n);
+      buf[n] = '\0';
+      return String(buf);
+    };
+
+    if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef1"))) {
+      // Nickname
+      cfg.nickname = makeString(value);
+      prefs.putString("nickname", cfg.nickname);
+      LOG("[BLE] Nickname updated: %s\n", cfg.nickname.c_str());
+
+    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef2"))) {
+      // Latitude
+      cfg.lat = makeString(value);
+      prefs.putString("lat", cfg.lat);
+      LOG("[BLE] Latitude updated: %s\n", cfg.lat.c_str());
+
+    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef3"))) {
+      // Longitude
+      cfg.lon = makeString(value);
+      prefs.putString("lon", cfg.lon);
+      LOG("[BLE] Longitude updated: %s\n", cfg.lon.c_str());
+
+    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef4"))) {
+      // Interval minutes: uint32 LE
+      if (value.size() >= 4) {
+        uint32_t v =
+          (uint8_t)value[0] |
+          ((uint8_t)value[1] << 8) |
+          ((uint8_t)value[2] << 16) |
+          ((uint8_t)value[3] << 24);
+
+        if (v == 0) v = 30;
+        cfg.interval_min = v;
+        prefs.putUInt("interval_min", cfg.interval_min);
+        LOG("[BLE] Interval updated: %u min\n", (unsigned)cfg.interval_min);
+      } else {
+        LOG("[BLE] Interval write too small (%u bytes)\n", (unsigned)value.size());
+      }
+
+    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef5"))) {
+      // Wi-Fi SSID
+      cfg.wifi_ssid = makeString(value);
+      prefs.putString("wifi_ssid", cfg.wifi_ssid);
+      LOG("[BLE] WiFi SSID updated: %s\n", cfg.wifi_ssid.c_str());
+
+    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef6"))) {
+      // Wi-Fi password
+      cfg.wifi_pass = makeString(value);
+      prefs.putString("wifi_pass", cfg.wifi_pass);
+      LOG("[BLE] WiFi password updated (len=%u)\n", (unsigned)cfg.wifi_pass.length());
+
+    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef7"))) {
+      // Commit: app writes here when done; just restart
+      LOG("[BLE] Commit received, restarting...\n");
+      dumpCfgForDebug();
+      delay(200);
+      esp_restart();
+    }
+  }
+};
+
+// ================== BLE SETUP SESSION =================
+void RunBleSetupSession() {
+  LOG("[BLE] Starting BLE setup session\n");
+
+  // Short, deterministic name
+  String devName = "BioSensor-DirtDataN-" + macLast4();
+
+  NimBLEDevice::init(devName.c_str());
+  NimBLEDevice::setDeviceName(devName.c_str());
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+  NimBLEServer* pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  // Create service
+  NimBLEService* svc = pServer->createService("12345678-1234-5678-1234-56789abcdef0");
+
+  // Helper to create characteristics with callbacks
+  auto mkChar = [&](const char* uuid, uint32_t props) {
+    auto* c = svc->createCharacteristic(uuid, props);
+    c->setCallbacks(new ConfigCharCallbacks());
+    return c;
+  };
+
+  g_charNickname = mkChar("12345678-1234-5678-1234-56789abcdef1",
+                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  g_charLat      = mkChar("12345678-1234-5678-1234-56789abcdef2",
+                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  g_charLon      = mkChar("12345678-1234-5678-1234-56789abcdef3",
+                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  g_charInterval = mkChar("12345678-1234-5678-1234-56789abcdef4",
+                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  g_charSsid     = mkChar("12345678-1234-5678-1234-56789abcdef5",
+                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  g_charPass     = mkChar("12345678-1234-5678-1234-56789abcdef6",
+                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  g_charCommit   = mkChar("12345678-1234-5678-1234-56789abcdef7",
+                          NIMBLE_PROPERTY::WRITE);
+
+  // Seed values
+  g_charNickname->setValue(cfg.nickname.c_str());
+  g_charLat->setValue(cfg.lat.c_str());
+  g_charLon->setValue(cfg.lon.c_str());
+  {
+    uint32_t v = cfg.interval_min ? cfg.interval_min : 30;
+    uint8_t buf[4] = {
+      (uint8_t)(v & 0xFF),
+      (uint8_t)((v >> 8) & 0xFF),
+      (uint8_t)((v >> 16) & 0xFF),
+      (uint8_t)((v >> 24) & 0xFF)
+    };
+    g_charInterval->setValue(buf, 4);
+  }
+  g_charSsid->setValue(cfg.wifi_ssid.c_str());
+  g_charPass->setValue(cfg.wifi_pass.c_str());
+
+  svc->start();
+
+  // Advertising + scan response (this API DOES exist on your core)
+  NimBLEAdvertisementData advData;
+  NimBLEAdvertisementData scanData;
+
+  advData.setName(devName.c_str());           // short name in ADV
+  scanData.addServiceUUID(svc->getUUID());    // full 128-bit UUID in scan response
+
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->setAdvertisementData(advData);
+  adv->setScanResponseData(scanData);
+  adv->start();
+
+  LOG("[BLE] Advertising as %s\n", devName.c_str());
+
+  while (true) {
+    delay(500);
+    LOG("[LOOP] In BLE setup mode, waiting for writes... (connected=%d)\n",
+        g_bleClientConnected ? 1 : 0);
+  }
+}
+
+
 // ================== MODE DECISION =================
 bool bootButtonHeld() {
   pinMode(BOOT_BTN, INPUT_PULLUP);
   delay(10);
   return digitalRead(BOOT_BTN)==LOW;
-}
-bool needsWizard() {
-  if (bootButtonHeld()) return true;
-  if (!cfg.lat.length() || !cfg.lon.length()) return true;
-  if (!cfg.wifi_ssid.length()) return true;
-  return false;
 }
 
 // ================== ARDUINO ======================
@@ -1301,11 +1141,11 @@ void setup() {
   // Load config
   loadPrefs();
 
-  // Wizard mode
-  if (needsWizard()) {
-    LOG("[Setup] Complete (wizard mode) — starting captive portal\n");
-    startAP(); startDNS(); startHTTP();
-    while (true) { dns.processNextRequest(); server.handleClient(); delay(5); }
+  // If BOOT held at boot: enter BLE setup mode instead of sampling
+  if (bootButtonHeld()) {
+    LOG("[Setup] BOOT held — entering BLE setup mode\n");
+    RunBleSetupSession();
+    // RunBleSetupSession never returns (esp_restart() on disconnect/commit)
   }
 
   LOG("[Setup] Complete — starting measurement\n");
