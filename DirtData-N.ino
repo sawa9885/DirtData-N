@@ -1,7 +1,10 @@
 /************************************************************
- * DirtData Node (ESP32-C6, Arduino core)
+ * DirtData Node (ESP32-C6, Arduino core)  v1.2.0
  * ----------------------------------------------------------
- * - BLE Setup Mode (hold BOOT at boot to enter)
+ * - Any boot:
+ *      * If BOOT held at boot → FACTORY RESET (clear prefs,
+ *        restore defaults) then continue normal run.
+ *
  * - Normal one-shot run (on each wakeup):
  *      * Power sensor rail
  *      * Init I2C, SCD4x (robust, avoid-NACK), ADS1115
@@ -26,7 +29,20 @@
  *           - Build ArcGIS payload from SensorData_t and POST once
  *      * Log same SensorData_t as CSV row to /DirtData.csv on SD
  *        if SD logging enabled
- *      * Deep sleep for cfg.interval_min minutes
+ *
+ *      * Then, if BLE is enabled:
+ *           - Start runtime BLE server (config + OTA)
+ *           - Advertise for a 3s window
+ *           - If NO client ever connects during that window:
+ *                 → Stop advertising, deep sleep for interval_min
+ *           - If a client connects at any point:
+ *                 → Print "waiting on app"
+ *                 → Stay awake indefinitely (no sleep), keep BLE up
+ *                 → Allow the app to update config, OTA, etc.
+ *                 → On COMMIT write:
+ *                       - Apply timestamp to RTC if provided
+ *                       - Dump config
+ *                       - esp_restart()
  *
  * - DEBUG flag:
  *      DEBUG=1 → Serial + delay() in waits
@@ -113,7 +129,7 @@ struct SensorData_t {
 
 #include "esp_sleep.h"
 #include "esp_log.h"
-#include "esp_ota_ops.h"   // <-- OTA
+#include "esp_system.h"
 
 #include <SPI.h>
 #include <SD.h>
@@ -127,9 +143,9 @@ struct SensorData_t {
 using ArduinoJson::JsonObject;
 
 // ================== FIRMWARE VERSION ==================
-#define FW_VERSION       "1.1.1"
+#define FW_VERSION       "1.2.0"
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 1
+#define FW_VERSION_MINOR 2
 #define FW_VERSION_PATCH 0
 
 static const char* GetFirmwareVersion() {
@@ -147,6 +163,7 @@ static const char* GetFirmwareVersion() {
 // Forward declarations for Arduino preprocessor weirdness
 void LowPowerWaitMs(uint32_t ms);
 float ReadAdsVoltage(uint8_t channel);
+void RunRuntimeBleWindowOrSession();
 
 // ================== PINS ===================
 // Analog
@@ -203,7 +220,7 @@ struct Config {
   bool     sd_enable;
   bool     wifi_enable;
   bool     ble_enable;
-  uint32_t ble_adv_interval_sec; // seconds
+  uint32_t ble_adv_interval_sec; // seconds (conceptual; used for logs / future)
 } cfg;
 
 // ================== GLOBALS =================
@@ -229,7 +246,11 @@ DSTherm tempSensor(oneWire);
 bool g_sd_ok = false;
 
 // BLE globals
-static bool g_bleClientConnected = false;
+static bool g_runtimeClientConnected      = false;
+static bool g_runtimeClientEverConnected  = false;
+static NimBLEServer*      g_runtimeServer      = nullptr;
+static NimBLEAdvertising* g_runtimeAdvertising = nullptr;
+
 static NimBLECharacteristic* g_charNickname   = nullptr;
 static NimBLECharacteristic* g_charLat        = nullptr;
 static NimBLECharacteristic* g_charLon        = nullptr;
@@ -241,6 +262,11 @@ static NimBLECharacteristic* g_charFwVersion  = nullptr;
 // OTA characteristics
 static NimBLECharacteristic* g_charOtaControl = nullptr;
 static NimBLECharacteristic* g_charOtaData    = nullptr;
+
+// ================== RTC STATE (persists across deep sleep) =================
+RTC_DATA_ATTR uint32_t g_elapsedSinceSampleSec = 0;
+RTC_DATA_ATTR bool     g_hasBootedOnce        = false;
+
 
 // ================== BLE UUIDs (16-bit) =================
 // Services
@@ -265,16 +291,6 @@ static NimBLECharacteristic* g_charOtaData    = nullptr;
 // OTA characteristics
 #define UUID_CHR_OTA_CTRL      0xA101
 #define UUID_CHR_OTA_DATA      0xA102
-
-// ================== OTA STATE ==================
-struct OtaState_t {
-  bool active;
-  esp_ota_handle_t handle;
-  const esp_partition_t* part;
-  size_t bytesReceived;
-};
-
-static OtaState_t g_ota = { false, 0, nullptr, 0 };
 
 // ================== DEBUG SLEEP HELPER =================
 void LowPowerWaitMs(uint32_t ms) {
@@ -777,10 +793,10 @@ static String buildArcGisFeaturesJson(const SensorData_t &d) {
 bool connectWiFiSTA(const String& ssid, const String& pass, uint32_t timeoutMs=20000) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid.c_str(), pass.c_str());
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) {
-    delay(200);
-  }
+  // uint32_t t0 = millis();
+  // while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) {
+  //   delay(200);
+  // }
   return (WiFi.status() == WL_CONNECTED);
 }
 
@@ -1006,14 +1022,21 @@ bool sdAppendSample(const SensorData_t &d) {
 }
 
 // ================== SLEEP =================
-void SleepMinutes(uint32_t minutes) {
-  uint64_t us = (uint64_t)minutes * 60ULL * 1000000ULL;
-  LOG("[Run] Complete, sleeping %lu min\n", (unsigned long)minutes);
+void SleepSeconds(uint32_t seconds) {
+  if (seconds == 0) seconds = 1;
+  uint64_t us = (uint64_t)seconds * 1000000ULL;
+  LOG("[Run] Complete, sleeping %lu s\n", (unsigned long)seconds);
   esp_sleep_enable_timer_wakeup(us);
   esp_deep_sleep_start();
 }
 
-// ================== CONFIG LOAD =================
+// (optional: keep for compatibility, now just wraps SleepSeconds)
+void SleepMinutes(uint32_t minutes) {
+  SleepSeconds(minutes * 60UL);
+}
+
+
+// ================== CONFIG LOAD / FACTORY RESET =================
 void loadPrefs() {
   prefs.begin("dirtdata", false);
   cfg.nickname     = prefs.getString("nickname", "");
@@ -1030,29 +1053,29 @@ void loadPrefs() {
   cfg.ble_enable          = prefs.getUChar("ble_en",  0);
   cfg.ble_adv_interval_sec= prefs.getUInt("ble_adv_sec", 30);
   if (cfg.ble_adv_interval_sec == 0) cfg.ble_adv_interval_sec = 30;
+  prefs.end();
+}
+
+void factoryResetConfig() {
+  LOG("[Factory] Resetting preferences\n");
+  prefs.begin("dirtdata", false);
+  prefs.clear();
+  prefs.end();
+
+  cfg.nickname = "";
+  cfg.lat = "";
+  cfg.lon = "";
+  cfg.interval_min = 30;
+  cfg.wifi_ssid = "";
+  cfg.wifi_pass = "";
+  cfg.timestamp_iso = "";
+  cfg.sd_enable = true;
+  cfg.wifi_enable = true;
+  cfg.ble_enable = true;
+  cfg.ble_adv_interval_sec = 30;
 }
 
 // ================== BLE CALLBACKS =================
-class MyServerCallbacks : public NimBLEServerCallbacks {
- public:
-  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
-    (void)pServer;
-    (void)connInfo;
-    LOG("[BLE] Client connected\n");
-    g_bleClientConnected = true;
-  }
-
-  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
-    (void)pServer;
-    (void)connInfo;
-    LOG("[BLE] Client disconnected, reason=%d\n", reason);
-    g_bleClientConnected = false;
-    LOG("[BLE] Restarting after disconnect\n");
-    delay(200);
-    esp_restart();
-  }
-};
-
 void dumpCfgForDebug() {
   LOG("[CFG] Dump (after BLE write):\n");
   LOG("  FW version : %s\n", GetFirmwareVersion());
@@ -1090,17 +1113,23 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
 
     if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_NICKNAME))) {
       cfg.nickname = makeString(value);
+      prefs.begin("dirtdata", false);
       prefs.putString("nickname", cfg.nickname);
+      prefs.end();
       LOG("[BLE] Nickname updated: %s\n", cfg.nickname.c_str());
 
     } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_LAT))) {
       cfg.lat = makeString(value);
+      prefs.begin("dirtdata", false);
       prefs.putString("lat", cfg.lat);
+      prefs.end();
       LOG("[BLE] Latitude updated: %s\n", cfg.lat.c_str());
 
     } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_LON))) {
       cfg.lon = makeString(value);
+      prefs.begin("dirtdata", false);
       prefs.putString("lon", cfg.lon);
+      prefs.end();
       LOG("[BLE] Longitude updated: %s\n", cfg.lon.c_str());
 
     } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_INTERVAL))) {
@@ -1113,7 +1142,9 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
 
         if (v == 0) v = 30;
         cfg.interval_min = v;
+        prefs.begin("dirtdata", false);
         prefs.putUInt("interval_min", cfg.interval_min);
+        prefs.end();
         LOG("[BLE] Interval updated: %u min\n", (unsigned)cfg.interval_min);
       } else {
         LOG("[BLE] Interval write too small (%u bytes)\n", (unsigned)value.size());
@@ -1121,12 +1152,16 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
 
     } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_SSID))) {
       cfg.wifi_ssid = makeString(value);
+      prefs.begin("dirtdata", false);
       prefs.putString("wifi_ssid", cfg.wifi_ssid);
+      prefs.end();
       LOG("[BLE] WiFi SSID updated: %s\n", cfg.wifi_ssid.c_str());
 
     } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_PASS))) {
       cfg.wifi_pass = makeString(value);
+      prefs.begin("dirtdata", false);
       prefs.putString("wifi_pass", cfg.wifi_pass);
+      prefs.end();
       LOG("[BLE] WiFi password updated (len=%u)\n", (unsigned)cfg.wifi_pass.length());
 
     } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_COMMIT))) {
@@ -1141,25 +1176,33 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
 
     } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_TIMESTAMP))) {
       cfg.timestamp_iso = makeString(value);
+      prefs.begin("dirtdata", false);
       prefs.putString("ts_iso", cfg.timestamp_iso);
+      prefs.end();
       LOG("[BLE] Timestamp ISO updated: %s\n", cfg.timestamp_iso.c_str());
 
     } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_SD_EN))) {
       bool en = (value.size() >= 1 && value[0] != 0);
       cfg.sd_enable = en;
+      prefs.begin("dirtdata", false);
       prefs.putUChar("sd_en", en ? 1 : 0);
+      prefs.end();
       LOG("[BLE] SD enable: %s\n", en ? "ON" : "OFF");
 
     } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_WIFI_EN))) {
       bool en = (value.size() >= 1 && value[0] != 0);
       cfg.wifi_enable = en;
+      prefs.begin("dirtdata", false);
       prefs.putUChar("wifi_en", en ? 1 : 0);
+      prefs.end();
       LOG("[BLE] WiFi enable: %s\n", en ? "ON" : "OFF");
 
     } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_BLE_EN))) {
       bool en = (value.size() >= 1 && value[0] != 0);
       cfg.ble_enable = en;
+      prefs.begin("dirtdata", false);
       prefs.putUChar("ble_en", en ? 1 : 0);
+      prefs.end();
       LOG("[BLE] BLE enable: %s\n", en ? "ON" : "OFF");
 
     } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_ADV_INT))) {
@@ -1170,9 +1213,11 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
           ((uint8_t)value[2] << 16) |
           ((uint8_t)value[3] << 24);
 
-        if (v == 0) v = 1;
+        if (v == 0) v = 30;
         cfg.ble_adv_interval_sec = v;
+        prefs.begin("dirtdata", false);
         prefs.putUInt("ble_adv_sec", cfg.ble_adv_interval_sec);
+        prefs.end();
         LOG("[BLE] Adv interval updated: %u s\n", (unsigned)cfg.ble_adv_interval_sec);
       } else {
         LOG("[BLE] Adv interval write too small (%u bytes)\n", (unsigned)value.size());
@@ -1187,81 +1232,15 @@ class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
     (void)connInfo;
     std::string v = c->getValue();
     LOG("[OTA] Control write, len=%u\n", (unsigned)v.size());
-
-    // Parse ASCII command ("start" / "done")
-    String cmd;
-    if (!v.empty()) {
-      char buf[16];
-      size_t n = v.size();
-      if (n >= sizeof(buf)) n = sizeof(buf) - 1;
-      memcpy(buf, v.data(), n);
-      buf[n] = '\0';
-      cmd = String(buf);
-      cmd.toLowerCase();
-    }
-
-    if (cmd == "start") {
-      if (g_ota.active) {
-        LOG("[OTA] Start requested but OTA already active, aborting previous\n");
-        esp_ota_end(g_ota.handle);
-        g_ota.active = false;
-      }
-
-      g_ota.part = esp_ota_get_next_update_partition(nullptr);
-      if (!g_ota.part) {
-        LOG("[OTA][ERR] esp_ota_get_next_update_partition failed\n");
-        return;
-      }
-
-      esp_err_t err = esp_ota_begin(g_ota.part, OTA_SIZE_UNKNOWN, &g_ota.handle);
-      if (err != ESP_OK) {
-        LOG("[OTA][ERR] esp_ota_begin failed: 0x%08X\n", (unsigned)err);
-        g_ota.active = false;
-        return;
-      }
-
-      g_ota.active = true;
-      g_ota.bytesReceived = 0;
-      LOG("[OTA] Started, writing to partition '%s' at 0x%08X\n",
-          g_ota.part->label, (unsigned)g_ota.part->address);
-
-    } else if (cmd == "done") {
-      if (!g_ota.active) {
-        LOG("[OTA] 'done' received but no active OTA\n");
-        return;
-      }
-
-      esp_err_t err = esp_ota_end(g_ota.handle);
-      if (err != ESP_OK) {
-        LOG("[OTA][ERR] esp_ota_end failed: 0x%08X\n", (unsigned)err);
-        g_ota.active = false;
-        return;
-      }
-
-      err = esp_ota_set_boot_partition(g_ota.part);
-      if (err != ESP_OK) {
-        LOG("[OTA][ERR] esp_ota_set_boot_partition failed: 0x%08X\n", (unsigned)err);
-        g_ota.active = false;
-        return;
-      }
-
-      LOG("[OTA] Completed, total bytes=%u — rebooting into new firmware\n",
-          (unsigned)g_ota.bytesReceived);
-
-      g_ota.active = false;
-      delay(250);
-      esp_restart();
-
-    } else {
-      LOG("[OTA] Unknown control command: '%s'\n", cmd.c_str());
-    }
+    // TODO: parse control command and hook up real OTA state machine.
   }
 
   void onRead(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     (void)connInfo;
-    const char* status = g_ota.active ? "in_progress" : "idle";
-    c->setValue(status);
-    LOG("[OTA] Control read -> %s\n", status);
+    LOG("[OTA] Control read\n");
+    // Example stub status: 0 = idle
+    uint8_t status = 0;
+    c->setValue(&status, 1);
   }
 };
 
@@ -1269,52 +1248,52 @@ class OtaDataCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     (void)connInfo;
     std::string data = c->getValue();
-    size_t len = data.size();
-
-    if (!g_ota.active) {
-      LOG("[OTA][WARN] Data received but OTA not active (ignored), len=%u\n",
-          (unsigned)len);
-      return;
-    }
-    if (len == 0) return;
-
-    esp_err_t err = esp_ota_write(g_ota.handle, data.data(), len);
-    if (err != ESP_OK) {
-      LOG("[OTA][ERR] esp_ota_write failed: 0x%08X (len=%u)\n",
-          (unsigned)err, (unsigned)len);
-      g_ota.active = false;
-      return;
-    }
-
-    g_ota.bytesReceived += len;
-
-    // Log occasionally so we don't slow everything down
-    if ((g_ota.bytesReceived % (16 * 1024)) < len) {
-      LOG("[OTA] Written %u bytes so far\n", (unsigned)g_ota.bytesReceived);
-    }
+    LOG("[OTA] Data chunk, len=%u\n", (unsigned)data.size());
+    // TODO: feed 'data' bytes into your OTA chunk handler / flash writer.
   }
 };
 
-// ================== BLE SETUP SESSION =================
-void RunBleSetupSession() {
-  LOG("[BLE] Starting BLE setup session\n");
+// ================== RUNTIME BLE SERVER CALLBACKS =================
+class RuntimeBleServerCallbacks : public NimBLEServerCallbacks {
+ public:
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+    (void)pServer;
+    (void)connInfo;
+    g_runtimeClientConnected = true;
+    g_runtimeClientEverConnected = true;
+    LOG("[BLE] Client connected, waiting on app...\n");
+  }
+
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+    (void)pServer;
+    (void)connInfo;
+    LOG("[BLE] Client disconnected, reason=%d\n", reason);
+    g_runtimeClientConnected = false;
+    // Do NOT restart advertising here; our runtime loop manages adv.
+  }
+};
+
+// ================== RUNTIME BLE INIT =================
+void InitRuntimeBle() {
+  if (g_runtimeServer != nullptr) {
+    return; // already initialized
+  }
+
+  LOG("[BLE] Initializing runtime BLE server\n");
   LOG("[BLE] Free heap at start: %u bytes\n", (unsigned)esp_get_free_heap_size());
 
-  String devName = "BioSensor-DirtDataNtest-" + macLast4();
+  String devName = "BioSensor-DirtDataN-" + macLast4();
 
   NimBLEDevice::init(devName.c_str());
   NimBLEDevice::setDeviceName(devName.c_str());
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
-  // Faster OTA: larger MTU + tighter connection interval
-  NimBLEDevice::setMTU(517);                     // max payload ~512 bytes
-
-  NimBLEServer* pServer = NimBLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
+  g_runtimeServer = NimBLEDevice::createServer();
+  g_runtimeServer->setCallbacks(new RuntimeBleServerCallbacks());
 
   // -------- CONFIG SERVICE --------
   LOG("[BLE] Starting config service (chars=13)\n");
-  NimBLEService* cfgSvc = pServer->createService(NimBLEUUID((uint16_t)UUID_SVC_CONFIG));
+  NimBLEService* cfgSvc = g_runtimeServer->createService(NimBLEUUID((uint16_t)UUID_SVC_CONFIG));
   LOG("[BLE] cfgSvc handle=%u\n", (unsigned)cfgSvc->getHandle());
 
   auto mkCharCfg = [&](uint16_t uuid16, uint32_t props) {
@@ -1365,7 +1344,7 @@ void RunBleSetupSession() {
 
   // -------- OTA SERVICE --------
   LOG("[BLE] Starting OTA service (chars=2)\n");
-  NimBLEService* otaSvc = pServer->createService(NimBLEUUID((uint16_t)UUID_SVC_OTA));
+  NimBLEService* otaSvc = g_runtimeServer->createService(NimBLEUUID((uint16_t)UUID_SVC_OTA));
   LOG("[BLE] otaSvc handle=%u\n", (unsigned)otaSvc->getHandle());
 
   auto mkCharOta = [&](uint16_t uuid16, uint32_t props, NimBLECharacteristicCallbacks* cb) {
@@ -1383,12 +1362,12 @@ void RunBleSetupSession() {
                                NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE,
                                new OtaControlCallbacks());
   {
-    const char* status = "idle";
-    if (g_charOtaControl) g_charOtaControl->setValue(status);
+    uint8_t status = 0; // idle
+    if (g_charOtaControl) g_charOtaControl->setValue(&status, 1);
   }
 
   g_charOtaData = mkCharOta(UUID_CHR_OTA_DATA,
-                            NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR,
+                            NIMBLE_PROPERTY::WRITE,
                             new OtaDataCallbacks());
 
   if (!otaSvc->start()) {
@@ -1444,7 +1423,7 @@ void RunBleSetupSession() {
     g_charFwVersion->setValue(GetFirmwareVersion());
   }
 
-  // ===== Advertising =====
+  // ===== Advertising data (we control start/stop separately) =====
   NimBLEAdvertisementData advData;
   NimBLEAdvertisementData scanData;
 
@@ -1452,21 +1431,52 @@ void RunBleSetupSession() {
   advData.addServiceUUID(cfgSvc->getUUID());  // config service in primary adv
   scanData.addServiceUUID(otaSvc->getUUID()); // OTA service in scan response
 
-  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  adv->setAdvertisementData(advData);
-  adv->setScanResponseData(scanData);
-  adv->start();
+  g_runtimeAdvertising = NimBLEDevice::getAdvertising();
+  g_runtimeAdvertising->setAdvertisementData(advData);
+  g_runtimeAdvertising->setScanResponseData(scanData);
 
-  std::string cfgStr = cfgSvc->getUUID().toString();
-  std::string otaStr = otaSvc->getUUID().toString();
-  LOG("[BLE] Advertising as %s\n", devName.c_str());
-  LOG("[BLE] Services: cfg=%s, ota=%s\n", cfgStr.c_str(), otaStr.c_str());
+  LOG("[BLE] Runtime BLE initialized as %s\n", devName.c_str());
+}
+
+// ================== RUNTIME BLE WINDOW / SESSION =================
+void RunRuntimeBleWindowOrSession() {
+  if (!cfg.ble_enable) {
+    LOG("[BLE] Runtime BLE disabled by config\n");
+    return;
+  }
+
+  InitRuntimeBle();
+
+  g_runtimeClientConnected     = false;
+  g_runtimeClientEverConnected = false;
+
+  const uint32_t advWindowMs = 3000; // 3s advertise window when NO connection
+  const uint32_t pollMs      = 100;
+
+  LOG("[BLE] Starting runtime advertising window (3s, then sleep if no connection)\n");
+  g_runtimeAdvertising->start();
+
+  uint32_t start = millis();
 
   while (true) {
-    delay(500);
-    LOG("[LOOP] In BLE setup mode, waiting for writes... (connected=%d, heap=%u)\n",
-        g_bleClientConnected ? 1 : 0,
-        (unsigned)esp_get_free_heap_size());
+    // If app committed config, we reboot inside the commit handler (esp_restart)
+    // so we don't need an explicit check here.
+
+    if (g_runtimeClientEverConnected) {
+      // We are in "config session" mode: stay awake, keep advertising, wait on app.
+      // No timeout here; commit write will reboot.
+      delay(pollMs);
+      continue;
+    }
+
+    // No client has ever connected during this boot: enforce 3s window.
+    if (millis() - start >= advWindowMs) {
+      LOG("[BLE] Runtime adv window expired, no connection; stopping BLE\n");
+      g_runtimeAdvertising->stop();
+      break;
+    }
+
+    delay(pollMs);
   }
 }
 
@@ -1491,7 +1501,6 @@ void setup() {
 
   LOG("\n[Setup] Booting\n");
   LOG("[Setup] FW version: %s\n", GetFirmwareVersion());
-  LOG("[Setup] Mode: one-shot sample + deep sleep (DEBUG=%d)\n", DEBUG);
 
   pinMode(ESP_PWR_3V3, OUTPUT); digitalWrite(ESP_PWR_3V3, LOW);
   pinMode(ESP_GPS_3V3, OUTPUT); digitalWrite(ESP_GPS_3V3, LOW);
@@ -1505,17 +1514,21 @@ void setup() {
 
   loadPrefs();
 
-  LOG("[Setup] SD=%s WiFi=%s BLE=%s AdvInt=%u s\n",
+  // BOOT held at power-on: FACTORY RESET + continue.
+  if (bootButtonHeld()) {
+    LOG("[Setup] BOOT held — FACTORY RESET\n");
+    factoryResetConfig();
+    loadPrefs();  // reload defaults into cfg
+  }
+
+  LOG("[Setup] SD=%s WiFi=%s BLE=%s AdvInt=%u s Interval=%u min\n",
       cfg.sd_enable   ? "ON" : "OFF",
       cfg.wifi_enable ? "ON" : "OFF",
       cfg.ble_enable  ? "ON" : "OFF",
-      (unsigned)cfg.ble_adv_interval_sec);
+      (unsigned)cfg.ble_adv_interval_sec,
+      (unsigned)cfg.interval_min);
 
-  if (bootButtonHeld()) {
-    LOG("[Setup] BOOT held — entering BLE setup mode\n");
-    RunBleSetupSession();
-  }
-
+  // If RTC time is bogus but we have a BLE timestamp, seed RTC once
   {
     time_t now = time(nullptr);
     const time_t cutoff = 1609459200L; // 2021-01-01
@@ -1524,105 +1537,147 @@ void setup() {
     }
   }
 
-  LOG("[Setup] Complete — starting measurement\n");
+  // ====== Decide timing: BLE adv wake interval vs sampling interval ======
+  uint32_t sampleSec = cfg.interval_min ? (cfg.interval_min * 60UL) : (30UL * 60UL);
+  uint32_t advSec    = cfg.ble_adv_interval_sec ? cfg.ble_adv_interval_sec : 30UL;
 
-  digitalWrite(ESP_PWR_3V3, HIGH);
-  LOG("[PWR] Sensor rail ON\n");
-  delay(20);
+  bool firstBootThisPower = !g_hasBootedOnce;
+  g_hasBootedOnce = true;
 
-  g_scd_present = scdInitRobust();
-
-  g_ads_present = adsInit();
-  LowPowerWaitMs(100);
-
-  scdWaitAndRead(6500);
-
-  float ads_v3v3    = NAN;
-  float ads_vbat_div= NAN;
-  float esp_vbat_mV = NAN;
-  float esp_moist_mV= NAN;
-  float esp_micro_mV= NAN;
-
-  AnalogSnapshot_t adsSnap = readAdsSnapshot(ads_v3v3, ads_vbat_div);
-  AnalogSnapshot_t espSnap = readEspSnapshot(esp_vbat_mV, esp_moist_mV, esp_micro_mV);
-  float soilTempC          = getSoilTempC();
-
-  SensorData_t sample{};
-  buildSensorDataFromSnapshots(sample,
-                               adsSnap,
-                               espSnap,
-                               ads_v3v3,
-                               ads_vbat_div,
-                               esp_vbat_mV,
-                               esp_moist_mV,
-                               esp_micro_mV,
-                               soilTempC);
-
-  bool wifi_ok = false;
-  if (!cfg.wifi_enable) {
-    LOG("[Cloud] Wi-Fi disabled by config\n");
-  } else if (!cfg.wifi_ssid.length()) {
-    LOG("[ERROR] [Cloud] No Wi-Fi configured\n");
-  } else {
-    wifi_ok = connectWiFiSTA(cfg.wifi_ssid, cfg.wifi_pass);
-    if (!wifi_ok) {
-      LOG("[ERROR] [Cloud] Wi-Fi connect failed\n");
-    }
-  }
-
-  bool gotTime = false;
-  if (cfg.wifi_enable && wifi_ok) {
-    gotTime = fetchTimeUTC(sample.timestampUtc, sizeof(sample.timestampUtc));
-    if (gotTime) {
-      LOG("[Time] Using NTP timestamp\n");
-    }
-  }
-  if (!gotTime) {
-    if (readRtcTimeUTC(sample.timestampUtc, sizeof(sample.timestampUtc))) {
-      LOG("[Time] Using RTC-only timestamp\n");
-      gotTime = true;
-    } else {
-      sample.timestampUtc[0] = '\0';
-      LOG("[Time] No valid time (no NTP, RTC invalid)\n");
-    }
-  }
-
-  logPayload(sample);
-
-  if (cfg.sd_enable) {
-    initSD();
-    sdAppendSample(sample);
-  } else {
-    LOG("[SD] SD logging disabled by config\n");
-  }
-
-  if (cfg.wifi_enable && wifi_ok) {
-    String cloudErr;
-    bool ok = UploadToCloudOnce(sample, cloudErr);
-    if (ok) {
-      LOG("[Cloud] Data posted\n");
-    } else if (cloudErr.length()) {
-      LOG("[ERROR] [Cloud] %s\n", cloudErr.c_str());
-    } else {
-      LOG("[ERROR] [Cloud] Unknown upload failure\n");
-    }
-  }
+  bool doSample = false;
 
   if (cfg.ble_enable) {
-    LOG("[BLE] (stub) Periodic advertising ENABLED, interval=%u s\n",
-        (unsigned)cfg.ble_adv_interval_sec);
+    // BLE enabled → wake every advSec, sample every sampleSec
+    if (firstBootThisPower) {
+      // Take a sample immediately on first power-up
+      doSample = true;
+      g_elapsedSinceSampleSec = 0;
+    } else {
+      g_elapsedSinceSampleSec += advSec;
+      if (g_elapsedSinceSampleSec >= sampleSec) {
+        doSample = true;
+        g_elapsedSinceSampleSec = 0;
+      }
+    }
   } else {
-    LOG("[BLE] (stub) Periodic BLE advertising DISABLED\n");
+    // BLE disabled → behave like old firmware: wake only for sampling interval
+    advSec = sampleSec;
+    doSample = true;
+    g_elapsedSinceSampleSec = 0;
   }
 
-  scdStop();
-  delay(5);
+  LOG("[Setup] Mode: doSample=%s, elapsedSinceSample=%u s, sampleSec=%u s, advSec=%u s (DEBUG=%d)\n",
+      doSample ? "YES" : "NO",
+      (unsigned)g_elapsedSinceSampleSec,
+      (unsigned)sampleSec,
+      (unsigned)advSec,
+      DEBUG);
 
-  digitalWrite(ESP_PWR_3V3, LOW);
-  LOG("[PWR] Sensor rail OFF\n");
+  // ============ SAMPLING PIPELINE (only when doSample = true) ============
+  SensorData_t sample{};
+  bool haveSample = false;
 
-  uint32_t minutes = cfg.interval_min ? cfg.interval_min : 30;
-  SleepMinutes(minutes);
+  if (doSample) {
+    LOG("[Setup] Starting measurement\n");
+
+    digitalWrite(ESP_PWR_3V3, HIGH);
+    LOG("[PWR] Sensor rail ON\n");
+    delay(20);
+
+    // SCD4x / ADS
+    g_scd_present = scdInitRobust();
+    g_ads_present = adsInit();
+    LowPowerWaitMs(100);
+
+    scdWaitAndRead(6500);
+
+    float ads_v3v3     = NAN;
+    float ads_vbat_div = NAN;
+    float esp_vbat_mV  = NAN;
+    float esp_moist_mV = NAN;
+    float esp_micro_mV = NAN;
+
+    AnalogSnapshot_t adsSnap = readAdsSnapshot(ads_v3v3, ads_vbat_div);
+    AnalogSnapshot_t espSnap = readEspSnapshot(esp_vbat_mV, esp_moist_mV, esp_micro_mV);
+    float soilTempC          = getSoilTempC();
+
+    buildSensorDataFromSnapshots(sample,
+                                 adsSnap,
+                                 espSnap,
+                                 ads_v3v3,
+                                 ads_vbat_div,
+                                 esp_vbat_mV,
+                                 esp_moist_mV,
+                                 esp_micro_mV,
+                                 soilTempC);
+
+    bool wifi_ok = false;
+    bool gotTime = false;
+
+    if (!cfg.wifi_enable) {
+      LOG("[Cloud] Wi-Fi disabled by config\n");
+    } else if (!cfg.wifi_ssid.length()) {
+      LOG("[ERROR] [Cloud] No Wi-Fi configured\n");
+    } else {
+      wifi_ok = connectWiFiSTA(cfg.wifi_ssid, cfg.wifi_pass);
+      if (!wifi_ok) {
+        LOG("[ERROR] [Cloud] Wi-Fi connect failed\n");
+      }
+    }
+
+    if (cfg.wifi_enable && wifi_ok) {
+      gotTime = fetchTimeUTC(sample.timestampUtc, sizeof(sample.timestampUtc));
+      if (gotTime) {
+        LOG("[Time] Using NTP timestamp\n");
+      }
+    }
+    if (!gotTime) {
+      if (readRtcTimeUTC(sample.timestampUtc, sizeof(sample.timestampUtc))) {
+        LOG("[Time] Using RTC-only timestamp\n");
+        gotTime = true;
+      } else {
+        sample.timestampUtc[0] = '\0';
+        LOG("[Time] No valid time (no NTP, RTC invalid)\n");
+      }
+    }
+
+    logPayload(sample);
+
+    if (cfg.sd_enable) {
+      initSD();
+      sdAppendSample(sample);
+    } else {
+      LOG("[SD] SD logging disabled by config\n");
+    }
+
+    if (cfg.wifi_enable && wifi_ok) {
+      String cloudErr;
+      bool ok = UploadToCloudOnce(sample, cloudErr);
+      if (ok) {
+        LOG("[Cloud] Data posted\n");
+      } else if (cloudErr.length()) {
+        LOG("[ERROR] [Cloud] %s\n", cloudErr.c_str());
+      } else {
+        LOG("[ERROR] [Cloud] Unknown upload failure\n");
+      }
+    }
+
+    // Stop SCD and power down sensor rail after sampling
+    scdStop();
+    delay(5);
+    digitalWrite(ESP_PWR_3V3, LOW);
+    LOG("[PWR] Sensor rail OFF\n");
+
+    haveSample = true;
+  } else {
+    LOG("[Setup] Skipping measurement this wake (BLE-only interval)\n");
+  }
+
+  // ---- Runtime BLE window / session (only if enabled) ----
+  RunRuntimeBleWindowOrSession();
+
+  // ===== Deep sleep until next wake (BLE adv interval or sampling interval) =====
+  SleepSeconds(advSec);
 }
 
 void loop() {
