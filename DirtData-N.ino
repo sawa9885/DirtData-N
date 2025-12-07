@@ -6,7 +6,7 @@
  *      * Power sensor rail
  *      * Init I2C, SCD4x (robust, avoid-NACK), ADS1115
  *      * WAIT for SCD4x data-ready (getDataReadyStatus +
- *        lowPowerWaitMs: delay vs light-sleep based on DEBUG)
+ *        LowPowerWaitMs: delay vs light-sleep based on DEBUG)
  *      * Take ONE snapshot:
  *           - SCD4x (CO₂, T, RH)
  *           - ADS1115:
@@ -38,7 +38,65 @@
  *      3) If neither valid → timestamp unset
  ************************************************************/
 
+// Standard integer / size types
+#include <cstdint>
+#include <cstddef>
+
+// ================== SNAPSHOTS & PAYLOAD =================
+struct AnalogSnapshot_t {
+  float vbat_v;     // battery voltage (V)
+  float vbat_pct;   // battery percent (%)
+  float moist_v;    // moisture node (V)
+  float moist_pct;  // moisture (%)
+  float micro_v;    // microbial node (V)
+  float r_ohms;     // derived resistance (Ω)
+};
+
+struct SensorData_t {
+  int32_t nodeId;
+  char    timestampUtc[32];   // "YYYY-MM-DDTHH:MM:SSZ"
+
+  float latitude;
+  float longitude;
+
+  // SCD4x
+  float co2PPM;
+  float airTempC;
+  float airHumidity;
+
+  // Soil temp
+  float soilTempC;
+
+  // Battery
+  float batteryVoltage;      // V (preferred ADS)
+  float batteryPercent;      // %
+
+  // Moisture
+  float soilMoisture_mV;     // mV at node
+  float soilMoisturePercent; // %
+
+  // Microbial
+  float microVoltage;        // V at node
+  float resistance;          // Ω
+
+  // ADS raw
+  float ads_v3v3;
+  float ads_moist_v;
+  float ads_micro_v;
+  float ads_vbat_div_v;
+
+  // ESP raw (mV)
+  float esp_vbat_mV;
+  float esp_moist_mV;
+  float esp_micro_mV;
+
+  char  nodeName[32];
+};
+
+// Arduino core
 #include <Arduino.h>
+
+// Arduino / ESP32 libs
 #include <WiFi.h>
 #include <Wire.h>
 #include <Preferences.h>
@@ -55,15 +113,28 @@
 
 #include "esp_sleep.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"   // <-- OTA
 
 #include <SPI.h>
 #include <SD.h>
 #include <time.h>
 #include <sys/time.h>
-
 #include <NimBLEDevice.h>
 #include <NimBLEAdvertising.h>
 #include <NimBLEAdvertisementData.h>
+
+// Make sure JsonObject is visible (ArduinoJson 6)
+using ArduinoJson::JsonObject;
+
+// ================== FIRMWARE VERSION ==================
+#define FW_VERSION       "1.1.1"
+#define FW_VERSION_MAJOR 1
+#define FW_VERSION_MINOR 1
+#define FW_VERSION_PATCH 0
+
+static const char* GetFirmwareVersion() {
+  return FW_VERSION;
+}
 
 // ================== DEBUG ==================
 #define DEBUG 1
@@ -72,6 +143,10 @@
 #else
   #define LOG(...) do {} while (0)
 #endif
+
+// Forward declarations for Arduino preprocessor weirdness
+void LowPowerWaitMs(uint32_t ms);
+float ReadAdsVoltage(uint8_t channel);
 
 // ================== PINS ===================
 // Analog
@@ -131,57 +206,6 @@ struct Config {
   uint32_t ble_adv_interval_sec; // seconds
 } cfg;
 
-// ================== SNAPSHOTS & PAYLOAD =================
-struct AnalogSnapshot_t {
-  float vbat_v;     // battery voltage (V)
-  float vbat_pct;   // battery percent (%)
-  float moist_v;    // moisture node (V)
-  float moist_pct;  // moisture (%)
-  float micro_v;    // microbial node (V)
-  float r_ohms;     // derived resistance (Ω)
-};
-
-struct SensorData_t {
-  int32_t nodeId;
-  char    timestampUtc[32];   // "YYYY-MM-DDTHH:MM:SSZ"
-
-  float latitude;
-  float longitude;
-
-  // SCD4x
-  float co2PPM;
-  float airTempC;
-  float airHumidity;
-
-  // Soil temp
-  float soilTempC;
-
-  // Battery
-  float batteryVoltage;      // V (preferred ADS)
-  float batteryPercent;      // %
-
-  // Moisture
-  float soilMoisture_mV;     // mV at node
-  float soilMoisturePercent; // %
-
-  // Microbial
-  float microVoltage;        // V at node
-  float resistance;          // Ω
-
-  // ADS raw
-  float ads_v3v3;
-  float ads_moist_v;
-  float ads_micro_v;
-  float ads_vbat_div_v;
-
-  // ESP raw (mV)
-  float esp_vbat_mV;
-  float esp_moist_mV;
-  float esp_micro_mV;
-
-  char  nodeName[32];
-};
-
 // ================== GLOBALS =================
 // SCD4x
 SensirionI2cScd4x scd4x;
@@ -206,16 +230,54 @@ bool g_sd_ok = false;
 
 // BLE globals
 static bool g_bleClientConnected = false;
-static NimBLECharacteristic* g_charNickname = nullptr;
-static NimBLECharacteristic* g_charLat      = nullptr;
-static NimBLECharacteristic* g_charLon      = nullptr;
-static NimBLECharacteristic* g_charInterval = nullptr;
-static NimBLECharacteristic* g_charSsid     = nullptr;
-static NimBLECharacteristic* g_charPass     = nullptr;
-static NimBLECharacteristic* g_charCommit   = nullptr;
+static NimBLECharacteristic* g_charNickname   = nullptr;
+static NimBLECharacteristic* g_charLat        = nullptr;
+static NimBLECharacteristic* g_charLon        = nullptr;
+static NimBLECharacteristic* g_charInterval   = nullptr;
+static NimBLECharacteristic* g_charSsid       = nullptr;
+static NimBLECharacteristic* g_charPass       = nullptr;
+static NimBLECharacteristic* g_charCommit     = nullptr;
+static NimBLECharacteristic* g_charFwVersion  = nullptr;
+// OTA characteristics
+static NimBLECharacteristic* g_charOtaControl = nullptr;
+static NimBLECharacteristic* g_charOtaData    = nullptr;
+
+// ================== BLE UUIDs (16-bit) =================
+// Services
+#define UUID_SVC_CONFIG        0xA000
+#define UUID_SVC_OTA           0xA100
+
+// Config characteristics
+#define UUID_CHR_NICKNAME      0xA001
+#define UUID_CHR_LAT           0xA002
+#define UUID_CHR_LON           0xA003
+#define UUID_CHR_INTERVAL      0xA004
+#define UUID_CHR_SSID          0xA005
+#define UUID_CHR_PASS          0xA006
+#define UUID_CHR_COMMIT        0xA007
+#define UUID_CHR_TIMESTAMP     0xA008
+#define UUID_CHR_SD_EN         0xA009
+#define UUID_CHR_WIFI_EN       0xA00A
+#define UUID_CHR_BLE_EN        0xA00B
+#define UUID_CHR_ADV_INT       0xA00C
+#define UUID_CHR_FW_VERSION    0xA00D
+
+// OTA characteristics
+#define UUID_CHR_OTA_CTRL      0xA101
+#define UUID_CHR_OTA_DATA      0xA102
+
+// ================== OTA STATE ==================
+struct OtaState_t {
+  bool active;
+  esp_ota_handle_t handle;
+  const esp_partition_t* part;
+  size_t bytesReceived;
+};
+
+static OtaState_t g_ota = { false, 0, nullptr, 0 };
 
 // ================== DEBUG SLEEP HELPER =================
-void lowPowerWaitMs(uint32_t ms) {
+void LowPowerWaitMs(uint32_t ms) {
 #if DEBUG
   delay(ms);
 #else
@@ -272,10 +334,10 @@ int32_t GetNodeIdFromMac() {
 }
 
 static String macLast4() {
-  uint64_t mac = ESP.getEfuseMac(); // 48-bit base MAC in eFuse
+  uint64_t mac = ESP.getEfuseMac();
   uint8_t b[6];
   for (int i = 0; i < 6; ++i) {
-    b[i] = (mac >> (8 * i)) & 0xFF;  // little-endian order
+    b[i] = (mac >> (8 * i)) & 0xFF;
   }
   char buf[5];
   snprintf(buf, sizeof(buf), "%02X%02X", b[4], b[5]);
@@ -293,7 +355,6 @@ static String macStr() {
            b[0], b[1], b[2], b[3], b[4], b[5]);
   return String(buf);
 }
-
 
 // ================== JSON HELPERS =================
 static inline void setOrNullF(JsonObject obj, const char* key, float value, bool ok) {
@@ -323,7 +384,6 @@ static bool i2cProbe(uint8_t addr) {
   return (Wire.endTransmission() == 0);
 }
 
-// Avoid-NACK bring-up: probe → stop → reinit → start
 static bool scdInitRobust() {
   Wire.begin(ESP_SDA, ESP_SCL);
   Wire.setClock(I2C_SPEED_HZ);
@@ -355,7 +415,6 @@ static bool scdInitRobust() {
   return false;
 }
 
-// Wait for data-ready using getDataReadyStatus, then read once
 static bool scdWaitAndRead(uint32_t timeout_ms = 6500) {
   if (!g_scd_present || !g_scd_running) return false;
   uint32_t t0 = millis();
@@ -380,7 +439,7 @@ static bool scdWaitAndRead(uint32_t timeout_ms = 6500) {
       LOG("[ERROR] [SCD4x] readMeasurement=0x%04X (co2=%u)\n", (uint16_t)e, co2);
       return false;
     }
-    lowPowerWaitMs(250);  // DEBUG: delay, PROD: light sleep
+    LowPowerWaitMs(250);
   }
   LOG("[ERROR] [SCD4x] Timeout waiting for first sample\n");
   return false;
@@ -402,7 +461,7 @@ bool adsInit() {
   return true;
 }
 
-float adsReadVoltage(uint8_t channel) {
+float ReadAdsVoltage(uint8_t channel) {
   if (!g_ads_present) return NAN;
   int16_t raw = ads.readADC_SingleEnded(channel);
   float v = (float)raw * (ADS_FSR_V / 32768.0f);
@@ -419,10 +478,10 @@ AnalogSnapshot_t readAdsSnapshot(float &ads_v3v3, float &ads_vbat_div) {
     return a;
   }
 
-  float v_3v3   = adsReadVoltage(0);
-  float v_moist = adsReadVoltage(1);
-  float v_micro = adsReadVoltage(2);
-  float v_div   = adsReadVoltage(3);
+  float v_3v3   = ReadAdsVoltage(0);
+  float v_moist = ReadAdsVoltage(1);
+  float v_micro = ReadAdsVoltage(2);
+  float v_div   = ReadAdsVoltage(3);
 
   g_ads_v3v3   = v_3v3;
   ads_v3v3     = v_3v3;
@@ -535,20 +594,17 @@ void buildSensorDataFromSnapshots(SensorData_t &d,
   memset(&d, 0, sizeof(d));
 
   d.nodeId = GetNodeIdFromMac();
-  d.timestampUtc[0] = '\0'; // filled later after time source
+  d.timestampUtc[0] = '\0';
 
   d.latitude  = cfg.lat.length()? atof(cfg.lat.c_str()) : NAN;
   d.longitude = cfg.lon.length()? atof(cfg.lon.c_str()) : NAN;
 
-  // SCD4x (already read)
   d.co2PPM      = g_scd_co2;
   d.airTempC    = g_scd_temp;
   d.airHumidity = g_scd_rh;
 
-  // Soil temp
   d.soilTempC   = soilTempC;
 
-  // Preferred battery & moisture & resistance from ADS, fallback to ESP
   bool ads_bat_valid   = validF(adsSnap.vbat_v);
   bool esp_bat_valid   = validF(espSnap.vbat_v);
   bool ads_moist_valid = validF(adsSnap.moist_v);
@@ -558,32 +614,27 @@ void buildSensorDataFromSnapshots(SensorData_t &d,
   bool ads_micro_valid = validF(adsSnap.micro_v);
   bool esp_micro_valid = validF(espSnap.micro_v);
 
-  // Battery
   d.batteryVoltage = ads_bat_valid ? adsSnap.vbat_v :
                      (esp_bat_valid ? espSnap.vbat_v : NAN);
   d.batteryPercent = ads_bat_valid ? adsSnap.vbat_pct :
                      (esp_bat_valid ? espSnap.vbat_pct : NAN);
 
-  // Moisture
   float moist_v_pref = ads_moist_valid ? adsSnap.moist_v :
                        (esp_moist_valid ? espSnap.moist_v : NAN);
   d.soilMoisture_mV     = validF(moist_v_pref) ? moist_v_pref * 1000.0f : NAN;
   d.soilMoisturePercent = ads_moist_valid ? adsSnap.moist_pct :
                           (esp_moist_valid ? espSnap.moist_pct : NAN);
 
-  // Microbial
   d.microVoltage = ads_micro_valid ? adsSnap.micro_v :
                    (esp_micro_valid ? espSnap.micro_v : NAN);
   d.resistance   = ads_res_valid ? adsSnap.r_ohms :
                    (esp_res_valid ? espSnap.r_ohms : NAN);
 
-  // ADS raw
   d.ads_v3v3       = ads_v3v3;
   d.ads_moist_v    = adsSnap.moist_v;
   d.ads_micro_v    = adsSnap.micro_v;
   d.ads_vbat_div_v = ads_vbat_div;
 
-  // ESP raw
   d.esp_vbat_mV  = esp_vbat_mV;
   d.esp_moist_mV = esp_moist_mV;
   d.esp_micro_mV = esp_micro_mV;
@@ -591,7 +642,7 @@ void buildSensorDataFromSnapshots(SensorData_t &d,
   snprintf(d.nodeName, sizeof(d.nodeName), "%s", cfg.nickname.c_str());
 }
 
-// ======= PAYLOAD LOGGING (labels aligned with CSV) =========
+// ======= PAYLOAD LOGGING =========
 void logPayload(const SensorData_t &d) {
   LOG("[Payload] timestamp_utc: %s\n", d.timestampUtc[0] ? d.timestampUtc : "(unset)");
   LOG("[Payload] node_id: %ld\n", (long)d.nodeId);
@@ -680,14 +731,12 @@ static String buildArcGisFeaturesJson(const SensorData_t &d) {
 
   attrs["node_id"] = d.nodeId;
 
-  // Timestamp
   if (d.timestampUtc[0] != '\0') {
     attrs["timestamp_utc"] = d.timestampUtc;
   } else {
     attrs["timestamp_utc"] = nullptr;
   }
 
-  // Core metrics
   setOrNullF(attrs, "battery_voltage_v",      battery_v,        battery_v_ok);
   setOrNullI(attrs, "battery_percent",        battery_pct_i,    battery_ok);
   setOrNullF(attrs, "soil_moisture_percent",  soil_moist_pct,   soil_moist_ok);
@@ -699,16 +748,13 @@ static String buildArcGisFeaturesJson(const SensorData_t &d) {
   setOrNullF(attrs, "air_temp_c",             air_temp_c,       air_temp_ok);
   setOrNullF(attrs, "air_humidity_percent",   air_hum_pct,      air_hum_ok);
 
-  // Microbial node voltage
   setOrNullF(attrs, "micro_voltage_v",        micro_v,          micro_v_ok);
 
-  // ADS raw
   setOrNullF(attrs, "ads_v3v3_v",             ads_v3v3,         validF_(ads_v3v3));
   setOrNullF(attrs, "ads_moist_v",            ads_moist_v,      validF_(ads_moist_v));
   setOrNullF(attrs, "ads_micro_v",            ads_micro_v,      validF_(ads_micro_v));
   setOrNullF(attrs, "ads_vbat_div_v",         ads_vbat_div_v,   validF_(ads_vbat_div_v));
 
-  // ESP raw (mV)
   setOrNullF(attrs, "esp_vbat_mv",            esp_vbat_mv,      validF_(esp_vbat_mv));
   setOrNullF(attrs, "esp_moist_mv",           esp_moist_mv,     validF_(esp_moist_mv));
   setOrNullF(attrs, "esp_micro_mv",           esp_micro_mv,     validF_(esp_micro_mv));
@@ -738,9 +784,7 @@ bool connectWiFiSTA(const String& ssid, const String& pass, uint32_t timeoutMs=2
   return (WiFi.status() == WL_CONNECTED);
 }
 
-// NTP: only called when Wi-Fi is enabled and connected
 bool fetchTimeUTC(char *out, size_t len) {
-  // UTC
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   struct tm timeinfo;
   const uint32_t timeoutMs = 10000;
@@ -758,7 +802,6 @@ bool fetchTimeUTC(char *out, size_t len) {
   return false;
 }
 
-// Seed RTC from BLE ISO timestamp (used only if RTC looks uninitialized)
 bool setRtcFromIsoString(const String& iso) {
   if (!iso.length()) return false;
 
@@ -777,7 +820,7 @@ bool setRtcFromIsoString(const String& iso) {
   t.tm_min  = min;
   t.tm_sec  = sec;
 
-  time_t tt = mktime(&t); // with TZ=UTC, treat as UTC
+  time_t tt = mktime(&t);
   if (tt == (time_t)-1) {
     LOG("[Time] mktime failed for BLE ISO\n");
     return false;
@@ -791,7 +834,6 @@ bool setRtcFromIsoString(const String& iso) {
   return true;
 }
 
-// Read current RTC time (no NTP, just RTC)
 bool readRtcTimeUTC(char *out, size_t len) {
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 1000)) {
@@ -982,11 +1024,10 @@ void loadPrefs() {
   cfg.wifi_ssid    = prefs.getString("wifi_ssid", "");
   cfg.wifi_pass    = prefs.getString("wifi_pass", "");
 
-  // New fields
   cfg.timestamp_iso       = prefs.getString("ts_iso", "");
-  cfg.sd_enable           = prefs.getUChar("sd_en",   1);  // default SD ON
-  cfg.wifi_enable         = prefs.getUChar("wifi_en", 1);  // default Wi-Fi ON
-  cfg.ble_enable          = prefs.getUChar("ble_en",  0);  // default BLE periodic OFF
+  cfg.sd_enable           = prefs.getUChar("sd_en",   1);
+  cfg.wifi_enable         = prefs.getUChar("wifi_en", 1);
+  cfg.ble_enable          = prefs.getUChar("ble_en",  0);
   cfg.ble_adv_interval_sec= prefs.getUInt("ble_adv_sec", 30);
   if (cfg.ble_adv_interval_sec == 0) cfg.ble_adv_interval_sec = 30;
 }
@@ -1014,6 +1055,7 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
 
 void dumpCfgForDebug() {
   LOG("[CFG] Dump (after BLE write):\n");
+  LOG("  FW version : %s\n", GetFirmwareVersion());
   LOG("  Nickname   : '%s'\n", cfg.nickname.c_str());
   LOG("  Lat        : '%s'\n", cfg.lat.c_str());
   LOG("  Lon        : '%s'\n", cfg.lon.c_str());
@@ -1046,26 +1088,22 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
       return String(buf);
     };
 
-    if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef1"))) {
-      // Nickname
+    if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_NICKNAME))) {
       cfg.nickname = makeString(value);
       prefs.putString("nickname", cfg.nickname);
       LOG("[BLE] Nickname updated: %s\n", cfg.nickname.c_str());
 
-    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef2"))) {
-      // Latitude
+    } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_LAT))) {
       cfg.lat = makeString(value);
       prefs.putString("lat", cfg.lat);
       LOG("[BLE] Latitude updated: %s\n", cfg.lat.c_str());
 
-    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef3"))) {
-      // Longitude
+    } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_LON))) {
       cfg.lon = makeString(value);
       prefs.putString("lon", cfg.lon);
       LOG("[BLE] Longitude updated: %s\n", cfg.lon.c_str());
 
-    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef4"))) {
-      // Interval minutes: uint32 LE
+    } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_INTERVAL))) {
       if (value.size() >= 4) {
         uint32_t v =
           (uint8_t)value[0] |
@@ -1081,20 +1119,17 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
         LOG("[BLE] Interval write too small (%u bytes)\n", (unsigned)value.size());
       }
 
-    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef5"))) {
-      // Wi-Fi SSID
+    } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_SSID))) {
       cfg.wifi_ssid = makeString(value);
       prefs.putString("wifi_ssid", cfg.wifi_ssid);
       LOG("[BLE] WiFi SSID updated: %s\n", cfg.wifi_ssid.c_str());
 
-    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef6"))) {
-      // Wi-Fi password
+    } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_PASS))) {
       cfg.wifi_pass = makeString(value);
       prefs.putString("wifi_pass", cfg.wifi_pass);
       LOG("[BLE] WiFi password updated (len=%u)\n", (unsigned)cfg.wifi_pass.length());
 
-    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef7"))) {
-      // Commit: app writes here when done; set RTC from BLE ISO (if present), then restart
+    } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_COMMIT))) {
       LOG("[BLE] Commit received\n");
       if (cfg.timestamp_iso.length()) {
         setRtcFromIsoString(cfg.timestamp_iso);
@@ -1104,35 +1139,30 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
       delay(200);
       esp_restart();
 
-    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef8"))) {
-      // Timestamp ISO string
+    } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_TIMESTAMP))) {
       cfg.timestamp_iso = makeString(value);
       prefs.putString("ts_iso", cfg.timestamp_iso);
       LOG("[BLE] Timestamp ISO updated: %s\n", cfg.timestamp_iso.c_str());
 
-    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdef9"))) {
-      // SD enable: 1 byte 0/1
+    } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_SD_EN))) {
       bool en = (value.size() >= 1 && value[0] != 0);
       cfg.sd_enable = en;
       prefs.putUChar("sd_en", en ? 1 : 0);
       LOG("[BLE] SD enable: %s\n", en ? "ON" : "OFF");
 
-    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdefa"))) {
-      // Wi-Fi enable: 1 byte 0/1
+    } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_WIFI_EN))) {
       bool en = (value.size() >= 1 && value[0] != 0);
       cfg.wifi_enable = en;
       prefs.putUChar("wifi_en", en ? 1 : 0);
       LOG("[BLE] WiFi enable: %s\n", en ? "ON" : "OFF");
 
-    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdefb"))) {
-      // BLE enable: 1 byte 0/1
+    } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_BLE_EN))) {
       bool en = (value.size() >= 1 && value[0] != 0);
       cfg.ble_enable = en;
       prefs.putUChar("ble_en", en ? 1 : 0);
       LOG("[BLE] BLE enable: %s\n", en ? "ON" : "OFF");
 
-    } else if (uuid.equals(NimBLEUUID("12345678-1234-5678-1234-56789abcdefc"))) {
-      // BLE advertising interval, uint32 LE seconds (min 1)
+    } else if (uuid.equals(NimBLEUUID((uint16_t)UUID_CHR_ADV_INT))) {
       if (value.size() >= 4) {
         uint32_t v =
           (uint8_t)value[0] |
@@ -1151,62 +1181,227 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+// ================== OTA CALLBACKS =================
+class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
+    (void)connInfo;
+    std::string v = c->getValue();
+    LOG("[OTA] Control write, len=%u\n", (unsigned)v.size());
+
+    // Parse ASCII command ("start" / "done")
+    String cmd;
+    if (!v.empty()) {
+      char buf[16];
+      size_t n = v.size();
+      if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+      memcpy(buf, v.data(), n);
+      buf[n] = '\0';
+      cmd = String(buf);
+      cmd.toLowerCase();
+    }
+
+    if (cmd == "start") {
+      if (g_ota.active) {
+        LOG("[OTA] Start requested but OTA already active, aborting previous\n");
+        esp_ota_end(g_ota.handle);
+        g_ota.active = false;
+      }
+
+      g_ota.part = esp_ota_get_next_update_partition(nullptr);
+      if (!g_ota.part) {
+        LOG("[OTA][ERR] esp_ota_get_next_update_partition failed\n");
+        return;
+      }
+
+      esp_err_t err = esp_ota_begin(g_ota.part, OTA_SIZE_UNKNOWN, &g_ota.handle);
+      if (err != ESP_OK) {
+        LOG("[OTA][ERR] esp_ota_begin failed: 0x%08X\n", (unsigned)err);
+        g_ota.active = false;
+        return;
+      }
+
+      g_ota.active = true;
+      g_ota.bytesReceived = 0;
+      LOG("[OTA] Started, writing to partition '%s' at 0x%08X\n",
+          g_ota.part->label, (unsigned)g_ota.part->address);
+
+    } else if (cmd == "done") {
+      if (!g_ota.active) {
+        LOG("[OTA] 'done' received but no active OTA\n");
+        return;
+      }
+
+      esp_err_t err = esp_ota_end(g_ota.handle);
+      if (err != ESP_OK) {
+        LOG("[OTA][ERR] esp_ota_end failed: 0x%08X\n", (unsigned)err);
+        g_ota.active = false;
+        return;
+      }
+
+      err = esp_ota_set_boot_partition(g_ota.part);
+      if (err != ESP_OK) {
+        LOG("[OTA][ERR] esp_ota_set_boot_partition failed: 0x%08X\n", (unsigned)err);
+        g_ota.active = false;
+        return;
+      }
+
+      LOG("[OTA] Completed, total bytes=%u — rebooting into new firmware\n",
+          (unsigned)g_ota.bytesReceived);
+
+      g_ota.active = false;
+      delay(250);
+      esp_restart();
+
+    } else {
+      LOG("[OTA] Unknown control command: '%s'\n", cmd.c_str());
+    }
+  }
+
+  void onRead(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
+    (void)connInfo;
+    const char* status = g_ota.active ? "in_progress" : "idle";
+    c->setValue(status);
+    LOG("[OTA] Control read -> %s\n", status);
+  }
+};
+
+class OtaDataCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
+    (void)connInfo;
+    std::string data = c->getValue();
+    size_t len = data.size();
+
+    if (!g_ota.active) {
+      LOG("[OTA][WARN] Data received but OTA not active (ignored), len=%u\n",
+          (unsigned)len);
+      return;
+    }
+    if (len == 0) return;
+
+    esp_err_t err = esp_ota_write(g_ota.handle, data.data(), len);
+    if (err != ESP_OK) {
+      LOG("[OTA][ERR] esp_ota_write failed: 0x%08X (len=%u)\n",
+          (unsigned)err, (unsigned)len);
+      g_ota.active = false;
+      return;
+    }
+
+    g_ota.bytesReceived += len;
+
+    // Log occasionally so we don't slow everything down
+    if ((g_ota.bytesReceived % (16 * 1024)) < len) {
+      LOG("[OTA] Written %u bytes so far\n", (unsigned)g_ota.bytesReceived);
+    }
+  }
+};
+
 // ================== BLE SETUP SESSION =================
 void RunBleSetupSession() {
   LOG("[BLE] Starting BLE setup session\n");
+  LOG("[BLE] Free heap at start: %u bytes\n", (unsigned)esp_get_free_heap_size());
 
-  // Short, deterministic name
-  String devName = "BioSensor-DirtDataN-" + macLast4();
+  String devName = "BioSensor-DirtDataNtest-" + macLast4();
 
   NimBLEDevice::init(devName.c_str());
   NimBLEDevice::setDeviceName(devName.c_str());
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
+  // Faster OTA: larger MTU + tighter connection interval
+  NimBLEDevice::setMTU(517);                     // max payload ~512 bytes
+
   NimBLEServer* pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
-  // Create service
-  NimBLEService* svc = pServer->createService("12345678-1234-5678-1234-56789abcdef0");
+  // -------- CONFIG SERVICE --------
+  LOG("[BLE] Starting config service (chars=13)\n");
+  NimBLEService* cfgSvc = pServer->createService(NimBLEUUID((uint16_t)UUID_SVC_CONFIG));
+  LOG("[BLE] cfgSvc handle=%u\n", (unsigned)cfgSvc->getHandle());
 
-  // Helper to create characteristics with callbacks
-  auto mkChar = [&](const char* uuid, uint32_t props) {
-    auto* c = svc->createCharacteristic(uuid, props);
+  auto mkCharCfg = [&](uint16_t uuid16, uint32_t props) {
+    NimBLECharacteristic* c = cfgSvc->createCharacteristic(uuid16, props);
+    if (!c) {
+      LOG("[BLE][CFG] ERROR creating char 0x%04X\n", uuid16);
+      return (NimBLECharacteristic*)nullptr;
+    }
     c->setCallbacks(new ConfigCharCallbacks());
+    LOG("[BLE][CFG] char ok: 0x%04X handle=%u\n", uuid16, (unsigned)c->getHandle());
     return c;
   };
 
-  g_charNickname = mkChar("12345678-1234-5678-1234-56789abcdef1",
-                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  g_charLat      = mkChar("12345678-1234-5678-1234-56789abcdef2",
-                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  g_charLon      = mkChar("12345678-1234-5678-1234-56789abcdef3",
-                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  g_charInterval = mkChar("12345678-1234-5678-1234-56789abcdef4",
-                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  g_charSsid     = mkChar("12345678-1234-5678-1234-56789abcdef5",
-                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  g_charPass     = mkChar("12345678-1234-5678-1234-56789abcdef6",
-                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  g_charCommit   = mkChar("12345678-1234-5678-1234-56789abcdef7",
-                          NIMBLE_PROPERTY::WRITE);
+  g_charNickname = mkCharCfg(UUID_CHR_NICKNAME,
+                             NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  g_charLat      = mkCharCfg(UUID_CHR_LAT,
+                             NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  g_charLon      = mkCharCfg(UUID_CHR_LON,
+                             NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  g_charInterval = mkCharCfg(UUID_CHR_INTERVAL,
+                             NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  g_charSsid     = mkCharCfg(UUID_CHR_SSID,
+                             NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  g_charPass     = mkCharCfg(UUID_CHR_PASS,
+                             NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  g_charCommit   = mkCharCfg(UUID_CHR_COMMIT,
+                             NIMBLE_PROPERTY::WRITE);
 
-  // New characteristics
-  auto* c_tsIso   = mkChar("12345678-1234-5678-1234-56789abcdef8",
-                           NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  auto* c_sdEn    = mkChar("12345678-1234-5678-1234-56789abcdef9",
-                           NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  auto* c_wifiEn  = mkChar("12345678-1234-5678-1234-56789abcdefa",
-                           NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  auto* c_bleEn   = mkChar("12345678-1234-5678-1234-56789abcdefb",
-                           NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  auto* c_bleInt  = mkChar("12345678-1234-5678-1234-56789abcdefc",
-                           NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  NimBLECharacteristic* c_tsIso  = mkCharCfg(UUID_CHR_TIMESTAMP,
+                                             NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  NimBLECharacteristic* c_sdEn   = mkCharCfg(UUID_CHR_SD_EN,
+                                             NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  NimBLECharacteristic* c_wifiEn = mkCharCfg(UUID_CHR_WIFI_EN,
+                                             NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  NimBLECharacteristic* c_bleEn  = mkCharCfg(UUID_CHR_BLE_EN,
+                                             NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  NimBLECharacteristic* c_bleInt = mkCharCfg(UUID_CHR_ADV_INT,
+                                             NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
 
-  // Seed values
-  g_charNickname->setValue(cfg.nickname.c_str());
-  g_charLat->setValue(cfg.lat.c_str());
-  g_charLon->setValue(cfg.lon.c_str());
+  g_charFwVersion = mkCharCfg(UUID_CHR_FW_VERSION,
+                              NIMBLE_PROPERTY::READ);
+
+  if (!cfgSvc->start()) {
+    LOG("[BLE] ERROR: cfgSvc->start() failed!\n");
+  } else {
+    LOG("[BLE] Config service started, free heap: %u bytes\n", (unsigned)esp_get_free_heap_size());
+  }
+
+  // -------- OTA SERVICE --------
+  LOG("[BLE] Starting OTA service (chars=2)\n");
+  NimBLEService* otaSvc = pServer->createService(NimBLEUUID((uint16_t)UUID_SVC_OTA));
+  LOG("[BLE] otaSvc handle=%u\n", (unsigned)otaSvc->getHandle());
+
+  auto mkCharOta = [&](uint16_t uuid16, uint32_t props, NimBLECharacteristicCallbacks* cb) {
+    NimBLECharacteristic* c = otaSvc->createCharacteristic(uuid16, props);
+    if (!c) {
+      LOG("[BLE][OTA] ERROR creating char 0x%04X\n", uuid16);
+      return (NimBLECharacteristic*)nullptr;
+    }
+    c->setCallbacks(cb);
+    LOG("[BLE][OTA] char ok: 0x%04X handle=%u\n", uuid16, (unsigned)c->getHandle());
+    return c;
+  };
+
+  g_charOtaControl = mkCharOta(UUID_CHR_OTA_CTRL,
+                               NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE,
+                               new OtaControlCallbacks());
   {
+    const char* status = "idle";
+    if (g_charOtaControl) g_charOtaControl->setValue(status);
+  }
+
+  g_charOtaData = mkCharOta(UUID_CHR_OTA_DATA,
+                            NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR,
+                            new OtaDataCallbacks());
+
+  if (!otaSvc->start()) {
+    LOG("[BLE] ERROR: otaSvc->start() failed!\n");
+  } else {
+    LOG("[BLE] OTA service started, free heap: %u bytes\n", (unsigned)esp_get_free_heap_size());
+  }
+
+  // ===== Populate initial values =====
+  if (g_charNickname) g_charNickname->setValue(cfg.nickname.c_str());
+  if (g_charLat)      g_charLat->setValue(cfg.lat.c_str());
+  if (g_charLon)      g_charLon->setValue(cfg.lon.c_str());
+  if (g_charInterval) {
     uint32_t v = cfg.interval_min ? cfg.interval_min : 30;
     uint8_t buf[4] = {
       (uint8_t)(v & 0xFF),
@@ -1216,24 +1411,25 @@ void RunBleSetupSession() {
     };
     g_charInterval->setValue(buf, 4);
   }
-  g_charSsid->setValue(cfg.wifi_ssid.c_str());
-  g_charPass->setValue(cfg.wifi_pass.c_str());
+  if (g_charSsid) g_charSsid->setValue(cfg.wifi_ssid.c_str());
+  if (g_charPass) g_charPass->setValue(cfg.wifi_pass.c_str());
 
-  c_tsIso->setValue(cfg.timestamp_iso.c_str());
-
-  {
+  if (c_tsIso) {
+    c_tsIso->setValue(cfg.timestamp_iso.c_str());
+  }
+  if (c_sdEn) {
     uint8_t b = cfg.sd_enable ? 1 : 0;
     c_sdEn->setValue(&b, 1);
   }
-  {
+  if (c_wifiEn) {
     uint8_t b = cfg.wifi_enable ? 1 : 0;
     c_wifiEn->setValue(&b, 1);
   }
-  {
+  if (c_bleEn) {
     uint8_t b = cfg.ble_enable ? 1 : 0;
     c_bleEn->setValue(&b, 1);
   }
-  {
+  if (c_bleInt) {
     uint32_t v = cfg.ble_adv_interval_sec ? cfg.ble_adv_interval_sec : 30;
     uint8_t buf[4] = {
       (uint8_t)(v & 0xFF),
@@ -1244,29 +1440,35 @@ void RunBleSetupSession() {
     c_bleInt->setValue(buf, 4);
   }
 
-  svc->start();
+  if (g_charFwVersion) {
+    g_charFwVersion->setValue(GetFirmwareVersion());
+  }
 
-  // Advertising + scan response
+  // ===== Advertising =====
   NimBLEAdvertisementData advData;
   NimBLEAdvertisementData scanData;
 
-  advData.setName(devName.c_str());           // short name in ADV
-  scanData.addServiceUUID(svc->getUUID());    // full 128-bit UUID in scan response
+  advData.setName(devName.c_str());
+  advData.addServiceUUID(cfgSvc->getUUID());  // config service in primary adv
+  scanData.addServiceUUID(otaSvc->getUUID()); // OTA service in scan response
 
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->setAdvertisementData(advData);
   adv->setScanResponseData(scanData);
   adv->start();
 
+  std::string cfgStr = cfgSvc->getUUID().toString();
+  std::string otaStr = otaSvc->getUUID().toString();
   LOG("[BLE] Advertising as %s\n", devName.c_str());
+  LOG("[BLE] Services: cfg=%s, ota=%s\n", cfgStr.c_str(), otaStr.c_str());
 
   while (true) {
     delay(500);
-    LOG("[LOOP] In BLE setup mode, waiting for writes... (connected=%d)\n",
-        g_bleClientConnected ? 1 : 0);
+    LOG("[LOOP] In BLE setup mode, waiting for writes... (connected=%d, heap=%u)\n",
+        g_bleClientConnected ? 1 : 0,
+        (unsigned)esp_get_free_heap_size());
   }
 }
-
 
 // ================== MODE DECISION =================
 bool bootButtonHeld() {
@@ -1279,23 +1481,21 @@ bool bootButtonHeld() {
 void setup() {
 #if DEBUG
   Serial.begin(115200);
-  delay(1000);  // 1s after boot for USB to settle
+  delay(1000);
 #endif
 
-  // Force everything to be treated as UTC
   setenv("TZ", "UTC0", 1);
   tzset();
 
   esp_log_level_set("i2c", ESP_LOG_NONE);
 
   LOG("\n[Setup] Booting\n");
+  LOG("[Setup] FW version: %s\n", GetFirmwareVersion());
   LOG("[Setup] Mode: one-shot sample + deep sleep (DEBUG=%d)\n", DEBUG);
 
-  // Power rails
   pinMode(ESP_PWR_3V3, OUTPUT); digitalWrite(ESP_PWR_3V3, LOW);
   pinMode(ESP_GPS_3V3, OUTPUT); digitalWrite(ESP_GPS_3V3, LOW);
 
-  // ADC config
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
   pinMode(ESP_ADC_SEN,   INPUT);
@@ -1303,7 +1503,6 @@ void setup() {
   pinMode(ESP_ADC_MOIST, INPUT);
   pinMode(ESP_TEMP,      INPUT);
 
-  // Load config
   loadPrefs();
 
   LOG("[Setup] SD=%s WiFi=%s BLE=%s AdvInt=%u s\n",
@@ -1312,14 +1511,11 @@ void setup() {
       cfg.ble_enable  ? "ON" : "OFF",
       (unsigned)cfg.ble_adv_interval_sec);
 
-  // BLE setup mode?
   if (bootButtonHeld()) {
     LOG("[Setup] BOOT held — entering BLE setup mode\n");
     RunBleSetupSession();
-    // never returns (esp_restart on disconnect/commit)
   }
 
-  // If RTC looks uninitialized, seed it ONCE from BLE ISO timestamp (if present)
   {
     time_t now = time(nullptr);
     const time_t cutoff = 1609459200L; // 2021-01-01
@@ -1330,22 +1526,17 @@ void setup() {
 
   LOG("[Setup] Complete — starting measurement\n");
 
-  // Run mode: single shot
   digitalWrite(ESP_PWR_3V3, HIGH);
   LOG("[PWR] Sensor rail ON\n");
   delay(20);
 
-  // Init SCD4x
   g_scd_present = scdInitRobust();
 
-  // Init ADS1115 on same bus
   g_ads_present = adsInit();
-  lowPowerWaitMs(100);   // give ADS time before first read
+  LowPowerWaitMs(100);
 
-  // Wait for first SCD sample (using data-ready + light sleep/delay)
   scdWaitAndRead(6500);
 
-  // Take ONE ADS + ESP snapshot + soil temp
   float ads_v3v3    = NAN;
   float ads_vbat_div= NAN;
   float esp_vbat_mV = NAN;
@@ -1356,7 +1547,6 @@ void setup() {
   AnalogSnapshot_t espSnap = readEspSnapshot(esp_vbat_mV, esp_moist_mV, esp_micro_mV);
   float soilTempC          = getSoilTempC();
 
-  // Build SensorData_t from snapshots
   SensorData_t sample{};
   buildSensorDataFromSnapshots(sample,
                                adsSnap,
@@ -1368,7 +1558,6 @@ void setup() {
                                esp_micro_mV,
                                soilTempC);
 
-  // -------- Wi-Fi connect (gated by wifi_enable flag) --------
   bool wifi_ok = false;
   if (!cfg.wifi_enable) {
     LOG("[Cloud] Wi-Fi disabled by config\n");
@@ -1381,10 +1570,6 @@ void setup() {
     }
   }
 
-  // -------- Timestamp selection ----------
-  // 1) If Wi-Fi is enabled AND connected, try NTP (updates RTC).
-  // 2) Otherwise, use current RTC time (which may have been set by BLE or earlier NTP).
-  // 3) If RTC invalid, leave unset.
   bool gotTime = false;
   if (cfg.wifi_enable && wifi_ok) {
     gotTime = fetchTimeUTC(sample.timestampUtc, sizeof(sample.timestampUtc));
@@ -1402,10 +1587,8 @@ void setup() {
     }
   }
 
-  // Payload logging (after timestamp attempt)
   logPayload(sample);
 
-  // -------- SD log (with whatever timestamp we have), gated by SD flag --------
   if (cfg.sd_enable) {
     initSD();
     sdAppendSample(sample);
@@ -1413,7 +1596,6 @@ void setup() {
     LOG("[SD] SD logging disabled by config\n");
   }
 
-  // -------- Cloud upload (gated by wifi_enable flag) --------
   if (cfg.wifi_enable && wifi_ok) {
     String cloudErr;
     bool ok = UploadToCloudOnce(sample, cloudErr);
@@ -1426,7 +1608,6 @@ void setup() {
     }
   }
 
-  // -------- BLE periodic advertising stub --------
   if (cfg.ble_enable) {
     LOG("[BLE] (stub) Periodic advertising ENABLED, interval=%u s\n",
         (unsigned)cfg.ble_adv_interval_sec);
@@ -1434,19 +1615,16 @@ void setup() {
     LOG("[BLE] (stub) Periodic BLE advertising DISABLED\n");
   }
 
-  // Cleanly stop SCD before cutting power
   scdStop();
   delay(5);
 
-  // Power down sensor rail
   digitalWrite(ESP_PWR_3V3, LOW);
   LOG("[PWR] Sensor rail OFF\n");
 
-  // Deep sleep until next interval
   uint32_t minutes = cfg.interval_min ? cfg.interval_min : 30;
   SleepMinutes(minutes);
 }
 
 void loop() {
-  // never reached (deep sleep from setup)
+  // never reached
 }
