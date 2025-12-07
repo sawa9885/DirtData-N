@@ -1,5 +1,5 @@
 /************************************************************
- * DirtData Node (ESP32-C6, Arduino core)  v1.2.0
+ * DirtData Node (ESP32-C6, Arduino core)  v1.2.1
  * ----------------------------------------------------------
  * - Any boot:
  *      * If BOOT held at boot → FACTORY RESET (clear prefs,
@@ -57,6 +57,37 @@
 // Standard integer / size types
 #include <cstdint>
 #include <cstddef>
+
+// ================== FIRMWARE VERSION ==================
+#define FW_VERSION       "1.2.1"
+#define FW_VERSION_MAJOR 1
+#define FW_VERSION_MINOR 2
+#define FW_VERSION_PATCH 1
+
+// ================== DEFAULTS / CONSTANTS ==================
+#define DEFAULT_SAMPLE_INTERVAL_MIN        60UL    // default sampling interval (minutes)
+#define DEFAULT_BLE_ADV_INTERVAL_SEC       60UL    // default BLE advertising interval (seconds between wakeups)
+#define DEFAULT_BLE_ADV_WINDOW_MS          1000UL  // default BLE advertising window length (ms)
+
+#define DEBUG 1
+
+// Analog / measurement constants
+const float R_KNOWN             = 1000.0f;   // to 3V3
+const float DIVIDER_RATIO       = 2.0f;      // VBAT divider
+const float BATTERY_VOLTAGE_MAX = 4.5f;
+const float BATTERY_VOLTAGE_MIN = 2.0f;
+const float MOISTURE_MV_DRY     = 3300.0f;
+const float MOISTURE_MV_WET     = 1000.0f;
+
+// I2C
+#define I2C_SPEED_HZ 100000UL
+const uint8_t SCD4X_ADDR = 0x62;
+const uint8_t ADS_ADDR   = 0x48;
+
+// ============== CLOUD (ArcGIS) =============
+const char *ARC_ENDPOINT = "https://gis.dirtdata.ai/arcgis/rest/services/dirtdata/Dirt_Data_Nodes_POC/FeatureServer/0/addFeatures";
+const char *ARC_REFERER  = "https://sensor.dirtdata.ai";
+const char *ARC_API_KEY  = "AAPTg-FeepoS1ejSr4QBtPc02Zp-UeIfxKMnp96qOukL9MTt1OknOyChtkEQysGxYXi61t4XXUVHo7KQJEdrOxPhe3DSuFOgb46JJ8fUniAd0oPlBpC8hjn-V0kCDuUKtfqP0bon1bLJM5briX_nXmRgiogHzqhPOFLgM8k7hr7VxWRlq_C7GL7XfMmJt959xRSJ1XovVDrjkCd5J30Qhc_vFAayyoZyPmhCDSPTSkvQJnY.AT1_RjRfFhTZ";
 
 // ================== SNAPSHOTS & PAYLOAD =================
 struct AnalogSnapshot_t {
@@ -142,18 +173,11 @@ struct SensorData_t {
 // Make sure JsonObject is visible (ArduinoJson 6)
 using ArduinoJson::JsonObject;
 
-// ================== FIRMWARE VERSION ==================
-#define FW_VERSION       "1.2.0"
-#define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 2
-#define FW_VERSION_PATCH 0
-
 static const char* GetFirmwareVersion() {
   return FW_VERSION;
 }
 
 // ================== DEBUG ==================
-#define DEBUG 1
 #if DEBUG
   #define LOG(...) do { Serial.printf(__VA_ARGS__); } while (0)
 #else
@@ -185,24 +209,6 @@ void RunRuntimeBleWindowOrSession();
 #define SD_MISO       22
 #define SD_SCK        19
 #define SD_CS         21
-
-// ============== CONSTANTS ==================
-const float R_KNOWN             = 1000.0f;   // to 3V3
-const float DIVIDER_RATIO       = 2.0f;      // VBAT divider
-const float BATTERY_VOLTAGE_MAX = 4.5f;
-const float BATTERY_VOLTAGE_MIN = 2.0f;
-const float MOISTURE_MV_DRY     = 3300.0f;
-const float MOISTURE_MV_WET     = 1000.0f;
-
-// I2C
-#define I2C_SPEED_HZ 100000UL
-const uint8_t SCD4X_ADDR = 0x62;
-const uint8_t ADS_ADDR   = 0x48;
-
-// ============== CLOUD (ArcGIS) =============
-const char *ARC_ENDPOINT = "https://gis.dirtdata.ai/arcgis/rest/services/dirtdata/Dirt_Data_Nodes_POC/FeatureServer/0/addFeatures";
-const char *ARC_REFERER  = "https://sensor.dirtdata.ai";
-const char *ARC_API_KEY  = "AAPTg-FeepoS1ejSr4QBtPc02Zp-UeIfxKMnp96qOukL9MTt1OknOyChtkEQysGxYXi61t4XXUVHo7KQJEdrOxPhe3DSuFOgb46JJ8fUniAd0oPlBpC8hjn-V0kCDuUKtfqP0bon1bLJM5briX_nXmRgiogHzqhPOFLgM8k7hr7VxWRlq_C7GL7XfMmJt959xRSJ1XovVDrjkCd5J30Qhc_vFAayyoZyPmhCDSPTSkvQJnY.AT1_RjRfFhTZ";
 
 // ================== CONFIG =================
 Preferences prefs;
@@ -1042,17 +1048,17 @@ void loadPrefs() {
   cfg.nickname     = prefs.getString("nickname", "");
   cfg.lat          = prefs.getString("lat", "");
   cfg.lon          = prefs.getString("lon", "");
-  cfg.interval_min = prefs.getUInt("interval_min", 30);
-  if (cfg.interval_min == 0) cfg.interval_min = 30;
+  cfg.interval_min = prefs.getUInt("interval_min", DEFAULT_SAMPLE_INTERVAL_MIN);
+  if (cfg.interval_min == 0) cfg.interval_min = DEFAULT_SAMPLE_INTERVAL_MIN;
   cfg.wifi_ssid    = prefs.getString("wifi_ssid", "");
   cfg.wifi_pass    = prefs.getString("wifi_pass", "");
 
   cfg.timestamp_iso       = prefs.getString("ts_iso", "");
   cfg.sd_enable           = prefs.getUChar("sd_en",   1);
   cfg.wifi_enable         = prefs.getUChar("wifi_en", 1);
-  cfg.ble_enable          = prefs.getUChar("ble_en",  0);
-  cfg.ble_adv_interval_sec= prefs.getUInt("ble_adv_sec", 30);
-  if (cfg.ble_adv_interval_sec == 0) cfg.ble_adv_interval_sec = 30;
+  cfg.ble_enable          = prefs.getUChar("ble_en",  1);
+  cfg.ble_adv_interval_sec= prefs.getUInt("ble_adv_sec", DEFAULT_BLE_ADV_INTERVAL_SEC);
+  if (cfg.ble_adv_interval_sec == 0) cfg.ble_adv_interval_sec = DEFAULT_BLE_ADV_INTERVAL_SEC;
   prefs.end();
 }
 
@@ -1065,14 +1071,14 @@ void factoryResetConfig() {
   cfg.nickname = "";
   cfg.lat = "";
   cfg.lon = "";
-  cfg.interval_min = 30;
+  cfg.interval_min = DEFAULT_SAMPLE_INTERVAL_MIN;
   cfg.wifi_ssid = "";
   cfg.wifi_pass = "";
   cfg.timestamp_iso = "";
   cfg.sd_enable = true;
   cfg.wifi_enable = true;
   cfg.ble_enable = true;
-  cfg.ble_adv_interval_sec = 30;
+  cfg.ble_adv_interval_sec = DEFAULT_BLE_ADV_INTERVAL_SEC;
 }
 
 // ================== BLE CALLBACKS =================
@@ -1140,7 +1146,7 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
           ((uint8_t)value[2] << 16) |
           ((uint8_t)value[3] << 24);
 
-        if (v == 0) v = 30;
+        if (v == 0) v = DEFAULT_SAMPLE_INTERVAL_MIN;
         cfg.interval_min = v;
         prefs.begin("dirtdata", false);
         prefs.putUInt("interval_min", cfg.interval_min);
@@ -1213,7 +1219,7 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
           ((uint8_t)value[2] << 16) |
           ((uint8_t)value[3] << 24);
 
-        if (v == 0) v = 30;
+        if (v == 0) v = DEFAULT_BLE_ADV_INTERVAL_SEC;
         cfg.ble_adv_interval_sec = v;
         prefs.begin("dirtdata", false);
         prefs.putUInt("ble_adv_sec", cfg.ble_adv_interval_sec);
@@ -1381,7 +1387,7 @@ void InitRuntimeBle() {
   if (g_charLat)      g_charLat->setValue(cfg.lat.c_str());
   if (g_charLon)      g_charLon->setValue(cfg.lon.c_str());
   if (g_charInterval) {
-    uint32_t v = cfg.interval_min ? cfg.interval_min : 30;
+    uint32_t v = cfg.interval_min ? cfg.interval_min : DEFAULT_SAMPLE_INTERVAL_MIN;
     uint8_t buf[4] = {
       (uint8_t)(v & 0xFF),
       (uint8_t)((v >> 8) & 0xFF),
@@ -1409,7 +1415,7 @@ void InitRuntimeBle() {
     c_bleEn->setValue(&b, 1);
   }
   if (c_bleInt) {
-    uint32_t v = cfg.ble_adv_interval_sec ? cfg.ble_adv_interval_sec : 30;
+    uint32_t v = cfg.ble_adv_interval_sec ? cfg.ble_adv_interval_sec : DEFAULT_BLE_ADV_INTERVAL_SEC;
     uint8_t buf[4] = {
       (uint8_t)(v & 0xFF),
       (uint8_t)((v >> 8) & 0xFF),
@@ -1450,10 +1456,11 @@ void RunRuntimeBleWindowOrSession() {
   g_runtimeClientConnected     = false;
   g_runtimeClientEverConnected = false;
 
-  const uint32_t advWindowMs = 3000; // 3s advertise window when NO connection
+  const uint32_t advWindowMs = DEFAULT_BLE_ADV_WINDOW_MS; // 3s advertise window when NO connection
   const uint32_t pollMs      = 100;
 
-  LOG("[BLE] Starting runtime advertising window (3s, then sleep if no connection)\n");
+  LOG("[BLE] Starting runtime advertising window (%lu ms, then sleep if no connection)\n",
+      (unsigned long)advWindowMs);
   g_runtimeAdvertising->start();
 
   uint32_t start = millis();
@@ -1469,7 +1476,7 @@ void RunRuntimeBleWindowOrSession() {
       continue;
     }
 
-    // No client has ever connected during this boot: enforce 3s window.
+    // No client has ever connected during this boot: enforce adv window.
     if (millis() - start >= advWindowMs) {
       LOG("[BLE] Runtime adv window expired, no connection; stopping BLE\n");
       g_runtimeAdvertising->stop();
@@ -1538,8 +1545,8 @@ void setup() {
   }
 
   // ====== Decide timing: BLE adv wake interval vs sampling interval ======
-  uint32_t sampleSec = cfg.interval_min ? (cfg.interval_min * 60UL) : (30UL * 60UL);
-  uint32_t advSec    = cfg.ble_adv_interval_sec ? cfg.ble_adv_interval_sec : 30UL;
+  uint32_t sampleSec = cfg.interval_min ? (cfg.interval_min * 60UL) : (DEFAULT_SAMPLE_INTERVAL_MIN * 60UL);
+  uint32_t advSec    = cfg.ble_adv_interval_sec ? cfg.ble_adv_interval_sec : DEFAULT_BLE_ADV_INTERVAL_SEC;
 
   bool firstBootThisPower = !g_hasBootedOnce;
   g_hasBootedOnce = true;
