@@ -1,5 +1,5 @@
 /************************************************************
- * DirtData Node (ESP32-C6, Arduino core)  v1.2.1
+ * DirtData Node (ESP32-C6, Arduino core)  v1.2.2
  * ----------------------------------------------------------
  * - Any boot:
  *      * If BOOT held at boot → FACTORY RESET (clear prefs,
@@ -59,10 +59,10 @@
 #include <cstddef>
 
 // ================== FIRMWARE VERSION ==================
-#define FW_VERSION       "1.2.1"
+#define FW_VERSION       "1.2.2"
 #define FW_VERSION_MAJOR 1
 #define FW_VERSION_MINOR 2
-#define FW_VERSION_PATCH 1
+#define FW_VERSION_PATCH 2
 
 // ================== DEFAULTS / CONSTANTS ==================
 #define DEFAULT_SAMPLE_INTERVAL_MIN        60UL    // default sampling interval (minutes)
@@ -197,7 +197,6 @@ void RunRuntimeBleWindowOrSession();
 
 // Sensor rails / I2C / 1-Wire / button
 #define ESP_PWR_3V3    0   // SENSOR rail enable
-#define ESP_GPS_3V3    1
 #define ESP_SDA       10
 #define ESP_SCL       11
 #define ESP_TEMP       7
@@ -587,21 +586,51 @@ AnalogSnapshot_t readEspSnapshot(float &esp_vbat_mV, float &esp_moist_mV, float 
 }
 
 // ================== DS18B20 SOIL TEMP =================
+static void PrintScratchpad(const DSTherm::Scratchpad& sp) {
+  const uint8_t* b = sp.getRaw();
+  LOG("[TEMP] SP: %02X %02X %02X %02X %02X %02X %02X %02X %02X | rawTemp=0x%02X%02X\n",
+      b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8], b[1], b[0]);
+}
+
+
+
 float getSoilTempC() {
-  Placeholder<DSTherm::Scratchpad> scrpd;
-  tempSensor.convertTempAll(94, false); // 9-bit
+  Placeholder<DSTherm::Scratchpad> sp;
+
+  // Kick conversion for all devices (your library’s known-good call)
+  tempSensor.convertTempAll(94, true); // blocking
+
+  // Read first DS device found
   for (const auto& id : oneWire) {
-    if (DSTherm::getFamilyName(id)) {
-      if (tempSensor.readScratchpad(id, scrpd) == OneWireNg::EC_SUCCESS) {
-        float t = scrpd->getTemp2()/16.0f;
-        LOG("[TEMP] soilTempC=%.2f °C\n", t);
-        return t;
+    if (!DSTherm::getFamilyName(id)) continue;
+
+    if (tempSensor.readScratchpad(id, sp) == OneWireNg::EC_SUCCESS) {
+      PrintScratchpad(*sp);
+      float t = sp->getTemp2() / 16.0f;
+
+      // 85C is the DS18B20 power-up/default temp register (conversion not applied)
+      if (fabsf(t - 85.0f) < 0.01f) {
+        LOG("[TEMP] Got 85C (default). Waiting and retrying...\n");
+        delay(1000);
+
+        tempSensor.convertTempAll(94, true);
+        if (tempSensor.readScratchpad(id, sp) == OneWireNg::EC_SUCCESS) {
+          PrintScratchpad(*sp);
+          t = sp->getTemp2() / 16.0f;
+        }
       }
+
+      LOG("[TEMP] soilTempC=%.2f °C\n", t);
+      return t;
     }
   }
+
   LOG("[ERROR] [TEMP] No valid DS18B20 reading\n");
   return NAN;
 }
+
+
+
 
 // ================== BUILD SENSOR DATA FROM SNAPSHOTS =================
 void buildSensorDataFromSnapshots(SensorData_t &d,
@@ -1271,11 +1300,13 @@ class RuntimeBleServerCallbacks : public NimBLEServerCallbacks {
   }
 
   void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
-    (void)pServer;
-    (void)connInfo;
+    (void)pServer; (void)connInfo;
     LOG("[BLE] Client disconnected, reason=%d\n", reason);
     g_runtimeClientConnected = false;
-    // Do NOT restart advertising here; our runtime loop manages adv.
+
+    LOG("[BLE] Disconnect -> restarting device...\n");
+    delay(200);
+    esp_restart();
   }
 };
 
@@ -1510,14 +1541,12 @@ void setup() {
   LOG("[Setup] FW version: %s\n", GetFirmwareVersion());
 
   pinMode(ESP_PWR_3V3, OUTPUT); digitalWrite(ESP_PWR_3V3, LOW);
-  pinMode(ESP_GPS_3V3, OUTPUT); digitalWrite(ESP_GPS_3V3, LOW);
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
   pinMode(ESP_ADC_SEN,   INPUT);
   pinMode(ESP_ADC_VBAT,  INPUT);
   pinMode(ESP_ADC_MOIST, INPUT);
-  pinMode(ESP_TEMP,      INPUT);
 
   loadPrefs();
 
@@ -1589,7 +1618,7 @@ void setup() {
 
     digitalWrite(ESP_PWR_3V3, HIGH);
     LOG("[PWR] Sensor rail ON\n");
-    delay(20);
+    delay(250);
 
     // SCD4x / ADS
     g_scd_present = scdInitRobust();
