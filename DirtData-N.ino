@@ -1,5 +1,5 @@
 /************************************************************
- * DirtData Node (ESP32-C6, Arduino core)  v1.2.5
+ * DirtData Node (ESP32-C6, Arduino core)  v1.2.6
  * ----------------------------------------------------------
  * - Any boot:
  *      * If BOOT held at boot → FACTORY RESET (clear prefs,
@@ -59,10 +59,10 @@
 #include <cstddef>
 
 // ================== FIRMWARE VERSION ==================
-#define FW_VERSION       "1.2.5"
+#define FW_VERSION       "1.2.6"
 #define FW_VERSION_MAJOR 1
 #define FW_VERSION_MINOR 2
-#define FW_VERSION_PATCH 5
+#define FW_VERSION_PATCH 6
 
 // ================== DEFAULTS / CONSTANTS ==================
 #define DEFAULT_SAMPLE_INTERVAL_MIN        60UL    // default sampling interval (minutes)
@@ -1420,10 +1420,19 @@ class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
         OtaBegin();
         break;
 
-      case OTA_CMD_FINISH:
-        LOG("[OTA] CMD_FINISH\n");
-        OtaFinish();
-        break;
+    case OTA_CMD_FINISH:
+      LOG("[OTA] CMD_FINISH\n");
+      OtaFinish();
+
+      if (s_ota.status == OTA_STATUS_FINISHED) {
+        LOG("[OTA] OTA finished OK, rebooting into new firmware...\n");
+        vTaskDelay(pdMS_TO_TICKS(200));   // small delay for logs / BLE to flush
+        esp_restart();
+      } else {
+        LOG("[OTA] CMD_FINISH: OTA not in FINISHED state (status=%u, err=%d)\n",
+            s_ota.status, (int)s_ota.lastError);
+      }
+      break;
 
       case OTA_CMD_ABORT:
         LOG("[OTA] CMD_ABORT\n");
@@ -1485,7 +1494,7 @@ class OtaDataCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     (void)connInfo;
     std::string data = c->getValue();
-    LOG("[OTA] Data chunk, len=%u\n", (unsigned)data.size());
+    // LOG("[OTA] Data chunk, len=%u\n", (unsigned)data.size());
 
     if (data.empty()) {
       return;
@@ -1529,6 +1538,7 @@ void InitRuntimeBle() {
   String devName = "BioSensor-DirtDataN-" + macLast4();
 
   NimBLEDevice::init(devName.c_str());
+  NimBLEDevice::setMTU(517); 
   NimBLEDevice::setDeviceName(devName.c_str());
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
@@ -1611,7 +1621,7 @@ void InitRuntimeBle() {
   }
 
   g_charOtaData = mkCharOta(UUID_CHR_OTA_DATA,
-                            NIMBLE_PROPERTY::WRITE,
+                            NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR,
                             new OtaDataCallbacks());
 
   if (!otaSvc->start()) {
