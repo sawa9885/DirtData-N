@@ -1,5 +1,5 @@
 /************************************************************
- * DirtData Node (ESP32-C6, Arduino core)  v1.2.2
+ * DirtData Node (ESP32-C6, Arduino core)  v1.2.5
  * ----------------------------------------------------------
  * - Any boot:
  *      * If BOOT held at boot → FACTORY RESET (clear prefs,
@@ -59,10 +59,10 @@
 #include <cstddef>
 
 // ================== FIRMWARE VERSION ==================
-#define FW_VERSION       "1.2.2"
+#define FW_VERSION       "1.2.5"
 #define FW_VERSION_MAJOR 1
 #define FW_VERSION_MINOR 2
-#define FW_VERSION_PATCH 2
+#define FW_VERSION_PATCH 5
 
 // ================== DEFAULTS / CONSTANTS ==================
 #define DEFAULT_SAMPLE_INTERVAL_MIN        60UL    // default sampling interval (minutes)
@@ -161,6 +161,7 @@ struct SensorData_t {
 #include "esp_sleep.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_ota_ops.h"
 
 #include <SPI.h>
 #include <SD.h>
@@ -268,6 +269,31 @@ static NimBLECharacteristic* g_charFwVersion  = nullptr;
 static NimBLECharacteristic* g_charOtaControl = nullptr;
 static NimBLECharacteristic* g_charOtaData    = nullptr;
 
+// OTA Globals
+enum : uint8_t {
+  OTA_CMD_START   = 0x01,  // Begin OTA (erase + prepare partition)
+  OTA_CMD_FINISH  = 0x02,  // Finish OTA (set boot partition)
+  OTA_CMD_ABORT   = 0x03,  // Abort OTA
+  OTA_CMD_REBOOT  = 0x04,  // Reboot after successful OTA
+};
+
+enum : uint8_t {
+  OTA_STATUS_IDLE      = 0,
+  OTA_STATUS_INPROG    = 1,
+  OTA_STATUS_FINISHED  = 2,
+  OTA_STATUS_ERROR     = 3,
+};
+
+struct OtaContext {
+  esp_ota_handle_t           handle        = 0;
+  const esp_partition_t*     partition     = nullptr;
+  uint32_t                   bytesWritten  = 0;
+  uint8_t                    status        = OTA_STATUS_IDLE;
+  esp_err_t                  lastError     = ESP_OK;
+};
+
+static OtaContext s_ota;
+
 // ================== RTC STATE (persists across deep sleep) =================
 RTC_DATA_ATTR uint32_t g_elapsedSinceSampleSec = 0;
 RTC_DATA_ATTR bool     g_hasBootedOnce        = false;
@@ -296,6 +322,105 @@ RTC_DATA_ATTR bool     g_hasBootedOnce        = false;
 // OTA characteristics
 #define UUID_CHR_OTA_CTRL      0xA101
 #define UUID_CHR_OTA_DATA      0xA102
+
+// ================== OTA HELPER =========================
+static void OtaReset() {
+  s_ota.handle       = 0;
+  s_ota.partition    = nullptr;
+  s_ota.bytesWritten = 0;
+  s_ota.status       = OTA_STATUS_IDLE;
+  s_ota.lastError    = ESP_OK;
+}
+
+static void OtaBegin() {
+  if (s_ota.status == OTA_STATUS_INPROG) {
+    LOG("[OTA] Begin requested but OTA already in progress\n");
+    return;
+  }
+
+  OtaReset();
+
+  s_ota.partition = esp_ota_get_next_update_partition(nullptr);
+  if (!s_ota.partition) {
+    LOG("[OTA] Failed to get next update partition\n");
+    s_ota.status    = OTA_STATUS_ERROR;
+    s_ota.lastError = ESP_FAIL;
+    return;
+  }
+
+  esp_err_t err = esp_ota_begin(s_ota.partition, OTA_SIZE_UNKNOWN, &s_ota.handle);
+  if (err != ESP_OK) {
+    LOG("[OTA] esp_ota_begin failed: %d\n", (int)err);
+    s_ota.status    = OTA_STATUS_ERROR;
+    s_ota.lastError = err;
+    return;
+  }
+
+  s_ota.status = OTA_STATUS_INPROG;
+  LOG("[OTA] Begin on partition %s, addr=0x%08x size=%u\n",
+      s_ota.partition->label,
+      (unsigned)s_ota.partition->address,
+      (unsigned)s_ota.partition->size);
+}
+
+static void OtaFeed(const uint8_t* data, size_t len) {
+  if (s_ota.status != OTA_STATUS_INPROG) {
+    LOG("[OTA] Data received but OTA not in progress (status=%u)\n", s_ota.status);
+    return;
+  }
+
+  if (!data || !len) {
+    return;
+  }
+
+  esp_err_t err = esp_ota_write(s_ota.handle, data, len);
+  if (err != ESP_OK) {
+    LOG("[OTA] esp_ota_write failed: %d\n", (int)err);
+    s_ota.status    = OTA_STATUS_ERROR;
+    s_ota.lastError = err;
+    return;
+  }
+
+  s_ota.bytesWritten += len;
+  LOG("[OTA] Wrote %u bytes (total %u)\n", (unsigned)len, (unsigned)s_ota.bytesWritten);
+}
+
+static void OtaFinish() {
+  if (s_ota.status != OTA_STATUS_INPROG) {
+    LOG("[OTA] Finish requested but OTA not in progress (status=%u)\n", s_ota.status);
+    return;
+  }
+
+  esp_err_t err = esp_ota_end(s_ota.handle);
+  if (err != ESP_OK) {
+    LOG("[OTA] esp_ota_end failed: %d\n", (int)err);
+    s_ota.status    = OTA_STATUS_ERROR;
+    s_ota.lastError = err;
+    return;
+  }
+
+  err = esp_ota_set_boot_partition(s_ota.partition);
+  if (err != ESP_OK) {
+    LOG("[OTA] esp_ota_set_boot_partition failed: %d\n", (int)err);
+    s_ota.status    = OTA_STATUS_ERROR;
+    s_ota.lastError = err;
+    return;
+  }
+
+  s_ota.status = OTA_STATUS_FINISHED;
+  LOG("[OTA] OTA finished, %u bytes written. Boot partition set to %s\n",
+      (unsigned)s_ota.bytesWritten,
+      s_ota.partition ? s_ota.partition->label : "<null>");
+}
+
+static void OtaAbort() {
+  if (s_ota.status == OTA_STATUS_INPROG && s_ota.handle != 0) {
+    LOG("[OTA] Aborting OTA\n");
+    // esp_ota_end with non-OK result invalidates the image
+    esp_ota_end(s_ota.handle);
+  }
+  OtaReset();
+}
 
 // ================== DEBUG SLEEP HELPER =================
 void LowPowerWaitMs(uint32_t ms) {
@@ -454,7 +579,7 @@ static bool scdWaitAndRead(uint32_t timeout_ms = 6500) {
         g_scd_co2  = co2;
         g_scd_temp = t;
         g_scd_rh   = rh;
-        LOG("[SCD4x] CO₂=%.1f ppm | T=%.2f °C | RH=%.2f %%\n", g_scd_co2, g_scd_temp, g_scd_rh);
+        // LOG("[SCD4x] CO₂=%.1f ppm | T=%.2f °C | RH=%.2f %%\n", g_scd_co2, g_scd_temp, g_scd_rh);
         return true;
       }
       LOG("[ERROR] [SCD4x] readMeasurement=0x%04X (co2=%u)\n", (uint16_t)e, co2);
@@ -524,13 +649,13 @@ AnalogSnapshot_t readAdsSnapshot(float &ads_v3v3, float &ads_vbat_div) {
   a.micro_v   = v_micro;
   a.r_ohms    = r_micro;
 
-  LOG("[ADS1115] VBAT=%.3f V | BAT=%.1f %% | Moist=%.1f mV | MoistPct=%.1f %% | Micro=%.1f mV | R=%.1f Ω\n",
-      v_bat,
-      bat_pct,
-      moist_mv,
-      moist_pct,
-      micro_mv,
-      r_micro);
+  // LOG("[ADS1115] VBAT=%.3f V | BAT=%.1f %% | Moist=%.1f mV | MoistPct=%.1f %% | Micro=%.1f mV | R=%.1f Ω\n",
+      // v_bat,
+      // bat_pct,
+      // moist_mv,
+      // moist_pct,
+      // micro_mv,
+      // r_micro);
 
   return a;
 }
@@ -574,13 +699,13 @@ AnalogSnapshot_t readEspSnapshot(float &esp_vbat_mV, float &esp_moist_mV, float 
   esp_moist_mV = moist_mV;
   esp_micro_mV = micro_mV;
 
-  LOG("[ESP-ADC] VBAT=%.3f V | BAT=%.1f %% | Moist=%.1f mV | MoistPct=%.1f %% | Micro=%.1f mV | R=%.1f Ω\n",
-      vbat_V,
-      bat_pct,
-      moist_mV,
-      moist_pct,
-      micro_mV,
-      r_micro);
+  // LOG("[ESP-ADC] VBAT=%.3f V | BAT=%.1f %% | Moist=%.1f mV | MoistPct=%.1f %% | Micro=%.1f mV | R=%.1f Ω\n",
+  //     vbat_V,
+  //     bat_pct,
+  //     moist_mV,
+  //     moist_pct,
+  //     micro_mV,
+  //     r_micro);
 
   return a;
 }
@@ -588,8 +713,8 @@ AnalogSnapshot_t readEspSnapshot(float &esp_vbat_mV, float &esp_moist_mV, float 
 // ================== DS18B20 SOIL TEMP =================
 static void PrintScratchpad(const DSTherm::Scratchpad& sp) {
   const uint8_t* b = sp.getRaw();
-  LOG("[TEMP] SP: %02X %02X %02X %02X %02X %02X %02X %02X %02X | rawTemp=0x%02X%02X\n",
-      b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8], b[1], b[0]);
+  // LOG("[TEMP] SP: %02X %02X %02X %02X %02X %02X %02X %02X %02X | rawTemp=0x%02X%02X\n",
+  //     b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8], b[1], b[0]);
 }
 
 
@@ -610,7 +735,7 @@ float getSoilTempC() {
 
       // 85C is the DS18B20 power-up/default temp register (conversion not applied)
       if (fabsf(t - 85.0f) < 0.01f) {
-        LOG("[TEMP] Got 85C (default). Waiting and retrying...\n");
+        // LOG("[TEMP] Got 85C (default). Waiting and retrying...\n");
         delay(1000);
 
         tempSensor.convertTempAll(94, true);
@@ -620,7 +745,7 @@ float getSoilTempC() {
         }
       }
 
-      LOG("[TEMP] soilTempC=%.2f °C\n", t);
+      // LOG("[TEMP] soilTempC=%.2f °C\n", t);
       return t;
     }
   }
@@ -828,10 +953,10 @@ static String buildArcGisFeaturesJson(const SensorData_t &d) {
 bool connectWiFiSTA(const String& ssid, const String& pass, uint32_t timeoutMs=20000) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid.c_str(), pass.c_str());
-  // uint32_t t0 = millis();
-  // while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) {
-  //   delay(200);
-  // }
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) {
+    delay(20);
+  }
   return (WiFi.status() == WL_CONNECTED);
 }
 
@@ -1261,30 +1386,112 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
-// ================== OTA CALLBACKS =================
+/*******************************************************************
+ * BLE Callbacks – Control characteristic
+ *
+ * Protocol:
+ *   write 1 byte:
+ *     0x01 → start OTA
+ *     0x02 → finish OTA
+ *     0x03 → abort OTA
+ *     0x04 → reboot (if finished OK)
+ *
+ *   read → returns:
+ *     [0] = status (OTA_STATUS_*)
+ *     [1..4] = bytesWritten (uint32_t, little-endian)
+ *     [5..8] = lastError (esp_err_t, little-endian)
+ *******************************************************************/
+
 class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     (void)connInfo;
     std::string v = c->getValue();
-    LOG("[OTA] Control write, len=%u\n", (unsigned)v.size());
-    // TODO: parse control command and hook up real OTA state machine.
+    if (v.empty()) {
+      LOG("[OTA] Control write empty\n");
+      return;
+    }
+
+    uint8_t cmd = (uint8_t)v[0];
+    LOG("[OTA] Control write cmd=0x%02X len=%u\n", cmd, (unsigned)v.size());
+
+    switch (cmd) {
+      case OTA_CMD_START:
+        LOG("[OTA] CMD_START\n");
+        OtaBegin();
+        break;
+
+      case OTA_CMD_FINISH:
+        LOG("[OTA] CMD_FINISH\n");
+        OtaFinish();
+        break;
+
+      case OTA_CMD_ABORT:
+        LOG("[OTA] CMD_ABORT\n");
+        OtaAbort();
+        break;
+
+      case OTA_CMD_REBOOT:
+        LOG("[OTA] CMD_REBOOT\n");
+        if (s_ota.status == OTA_STATUS_FINISHED) {
+          LOG("[OTA] Rebooting into new firmware...\n");
+          vTaskDelay(pdMS_TO_TICKS(100)); // small delay to allow log flush
+          esp_restart();
+        } else {
+          LOG("[OTA] Reboot requested but OTA not in FINISHED state (status=%u)\n", s_ota.status);
+        }
+        break;
+
+      default:
+        LOG("[OTA] Unknown control cmd=0x%02X\n", cmd);
+        break;
+    }
   }
 
   void onRead(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     (void)connInfo;
     LOG("[OTA] Control read\n");
-    // Example stub status: 0 = idle
-    uint8_t status = 0;
-    c->setValue(&status, 1);
+
+    uint8_t buf[9];
+    buf[0] = s_ota.status;
+
+    uint32_t bytes = s_ota.bytesWritten;
+    buf[1] = (uint8_t)(bytes & 0xFF);
+    buf[2] = (uint8_t)((bytes >> 8) & 0xFF);
+    buf[3] = (uint8_t)((bytes >> 16) & 0xFF);
+    buf[4] = (uint8_t)((bytes >> 24) & 0xFF);
+
+    uint32_t err = (uint32_t)s_ota.lastError;
+    buf[5] = (uint8_t)(err & 0xFF);
+    buf[6] = (uint8_t)((err >> 8) & 0xFF);
+    buf[7] = (uint8_t)((err >> 16) & 0xFF);
+    buf[8] = (uint8_t)((err >> 24) & 0xFF);
+
+    c->setValue(buf, sizeof(buf));
   }
 };
+
+/*******************************************************************
+ * BLE Callbacks – Data characteristic
+ *
+ * App should:
+ *   1) Write CMD_START to control char
+ *   2) Stream firmware in chunks to data char
+ *   3) Write CMD_FINISH to control char
+ *   4) Optionally read control char to confirm status
+ *   5) Write CMD_REBOOT to control char to reboot into new image
+ *******************************************************************/
 
 class OtaDataCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     (void)connInfo;
     std::string data = c->getValue();
     LOG("[OTA] Data chunk, len=%u\n", (unsigned)data.size());
-    // TODO: feed 'data' bytes into your OTA chunk handler / flash writer.
+
+    if (data.empty()) {
+      return;
+    }
+
+    OtaFeed(reinterpret_cast<const uint8_t*>(data.data()), data.size());
   }
 };
 
@@ -1317,7 +1524,7 @@ void InitRuntimeBle() {
   }
 
   LOG("[BLE] Initializing runtime BLE server\n");
-  LOG("[BLE] Free heap at start: %u bytes\n", (unsigned)esp_get_free_heap_size());
+  // LOG("[BLE] Free heap at start: %u bytes\n", (unsigned)esp_get_free_heap_size());
 
   String devName = "BioSensor-DirtDataN-" + macLast4();
 
@@ -1329,9 +1536,9 @@ void InitRuntimeBle() {
   g_runtimeServer->setCallbacks(new RuntimeBleServerCallbacks());
 
   // -------- CONFIG SERVICE --------
-  LOG("[BLE] Starting config service (chars=13)\n");
+  // LOG("[BLE] Starting config service (chars=13)\n");
   NimBLEService* cfgSvc = g_runtimeServer->createService(NimBLEUUID((uint16_t)UUID_SVC_CONFIG));
-  LOG("[BLE] cfgSvc handle=%u\n", (unsigned)cfgSvc->getHandle());
+  // LOG("[BLE] cfgSvc handle=%u\n", (unsigned)cfgSvc->getHandle());
 
   auto mkCharCfg = [&](uint16_t uuid16, uint32_t props) {
     NimBLECharacteristic* c = cfgSvc->createCharacteristic(uuid16, props);
@@ -1340,7 +1547,7 @@ void InitRuntimeBle() {
       return (NimBLECharacteristic*)nullptr;
     }
     c->setCallbacks(new ConfigCharCallbacks());
-    LOG("[BLE][CFG] char ok: 0x%04X handle=%u\n", uuid16, (unsigned)c->getHandle());
+    // LOG("[BLE][CFG] char ok: 0x%04X handle=%u\n", uuid16, (unsigned)c->getHandle());
     return c;
   };
 
@@ -1380,9 +1587,9 @@ void InitRuntimeBle() {
   }
 
   // -------- OTA SERVICE --------
-  LOG("[BLE] Starting OTA service (chars=2)\n");
+  // LOG("[BLE] Starting OTA service (chars=2)\n");
   NimBLEService* otaSvc = g_runtimeServer->createService(NimBLEUUID((uint16_t)UUID_SVC_OTA));
-  LOG("[BLE] otaSvc handle=%u\n", (unsigned)otaSvc->getHandle());
+  // LOG("[BLE] otaSvc handle=%u\n", (unsigned)otaSvc->getHandle());
 
   auto mkCharOta = [&](uint16_t uuid16, uint32_t props, NimBLECharacteristicCallbacks* cb) {
     NimBLECharacteristic* c = otaSvc->createCharacteristic(uuid16, props);
@@ -1391,7 +1598,7 @@ void InitRuntimeBle() {
       return (NimBLECharacteristic*)nullptr;
     }
     c->setCallbacks(cb);
-    LOG("[BLE][OTA] char ok: 0x%04X handle=%u\n", uuid16, (unsigned)c->getHandle());
+    // LOG("[BLE][OTA] char ok: 0x%04X handle=%u\n", uuid16, (unsigned)c->getHandle());
     return c;
   };
 
@@ -1617,7 +1824,7 @@ void setup() {
     LOG("[Setup] Starting measurement\n");
 
     digitalWrite(ESP_PWR_3V3, HIGH);
-    LOG("[PWR] Sensor rail ON\n");
+    // LOG("[PWR] Sensor rail ON\n");
     delay(250);
 
     // SCD4x / ADS
@@ -1702,7 +1909,7 @@ void setup() {
     scdStop();
     delay(5);
     digitalWrite(ESP_PWR_3V3, LOW);
-    LOG("[PWR] Sensor rail OFF\n");
+    // LOG("[PWR] Sensor rail OFF\n");
 
     haveSample = true;
   } else {
