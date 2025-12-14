@@ -1,8 +1,8 @@
 {
-  "latestVersion": "1.2.2",
+  "latestVersion": "1.2.5",
   "firmware": {
-    "url": "https://github.com/sawa9885/DirtData-N/releases/download/v1.2.2/DirtData-N.ino.bin",
-    "size": 1598496,
-    "sha256": "1793a2b1a28520a447abe6aa75faa0cd92327d7496ce170bc62273eca53dd40e"
+    "url": "https://github.com/sawa9885/DirtData-N/releases/download/v1.2.5/DirtData-N.ino.bin",
+    "size": 1602800,
+    "sha256": "c28609cc24a4c34110466ccd801c16bef2ee86a605b9418c188097789fd95b28"
   }
 }
