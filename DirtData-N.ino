@@ -1,5 +1,5 @@
 /************************************************************
- * DirtData Node (ESP32-C6, Arduino core)  v1.2.6
+ * DirtData Node (ESP32-C6, Arduino core)  v1.3.0
  * ----------------------------------------------------------
  * - Any boot:
  *      * If BOOT held at boot → FACTORY RESET (clear prefs,
@@ -52,6 +52,19 @@
  *      1) NTP (if Wi-Fi enabled + connected)
  *      2) RTC (seeded once from BLE ISO timestamp, then free-runs)
  *      3) If neither valid → timestamp unset
+ *
+ * ----------------------------------------------------------
+ * NEW (BLE Sensor Payload Read):
+ *   - Config service (0xA000) now includes READ char 0xA00E
+ *   - On READ (offset==0), trigger a fresh sample and build JSON
+ *     for SensorData_t with nulls for invalid fields.
+ *   - Chunked reads supported:
+ *        * Write 4 bytes LE "offset" to 0xA00E
+ *        * Read  0xA00E returns:
+ *              [0..3]  total_len (uint32 LE)
+ *              [4..7]  offset    (uint32 LE)
+ *              [8..]   payload bytes (chunk)
+ *     - If offset==0 => triggers fresh sample and caches JSON.
  ************************************************************/
 
 // Standard integer / size types
@@ -59,10 +72,10 @@
 #include <cstddef>
 
 // ================== FIRMWARE VERSION ==================
-#define FW_VERSION       "1.2.6"
+#define FW_VERSION       "1.3.0"
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 2
-#define FW_VERSION_PATCH 6
+#define FW_VERSION_MINOR 3
+#define FW_VERSION_PATCH 0
 
 // ================== DEFAULTS / CONSTANTS ==================
 #define DEFAULT_SAMPLE_INTERVAL_MIN        60UL    // default sampling interval (minutes)
@@ -97,6 +110,12 @@ struct AnalogSnapshot_t {
   float moist_pct;  // moisture (%)
   float micro_v;    // microbial node (V)
   float r_ohms;     // derived resistance (Ω)
+};
+
+struct SensorStatus_t {
+  bool scd_ok;
+  bool ds18b20_ok;
+  bool ads_ok;
 };
 
 struct SensorData_t {
@@ -189,6 +208,15 @@ static const char* GetFirmwareVersion() {
 void LowPowerWaitMs(uint32_t ms);
 float ReadAdsVoltage(uint8_t channel);
 void RunRuntimeBleWindowOrSession();
+// ---- Wi-Fi test forward decls (fix Arduino auto-prototype issues) ----
+enum WifiTestState : uint8_t;                 // forward declare the enum type
+static const char* WifiStateToStr(WifiTestState s);
+class WifiTestCallbacks;                      // forward declare the class
+
+
+// NEW: Sensor payload helpers
+static bool TakeFreshSensorSample(SensorData_t &out);
+static std::string BuildSensorDataJson(const SensorData_t &d);
 
 // ================== PINS ===================
 // Analog
@@ -209,6 +237,7 @@ void RunRuntimeBleWindowOrSession();
 #define SD_MISO       22
 #define SD_SCK        19
 #define SD_CS         21
+
 
 // ================== CONFIG =================
 Preferences prefs;
@@ -265,9 +294,44 @@ static NimBLECharacteristic* g_charSsid       = nullptr;
 static NimBLECharacteristic* g_charPass       = nullptr;
 static NimBLECharacteristic* g_charCommit     = nullptr;
 static NimBLECharacteristic* g_charFwVersion  = nullptr;
+
+// NEW: sensor payload characteristic
+static NimBLECharacteristic* g_charSensorPayload = nullptr;
+static NimBLECharacteristic* g_charWifiTest = nullptr;
+
 // OTA characteristics
 static NimBLECharacteristic* g_charOtaControl = nullptr;
 static NimBLECharacteristic* g_charOtaData    = nullptr;
+
+// NEW: cached payload for chunked reads
+static SensorStatus_t g_lastStatus;
+static std::string g_payloadJson;
+static uint32_t    g_payloadOffset = 0;
+static uint32_t    g_payloadTotalLen = 0;
+static bool        g_payloadValid = false;
+
+// ================== Wi-Fi Test (BLE) ==================
+enum WifiTestState : uint8_t { WIFI_IDLE=0, WIFI_CONNECTING=1, WIFI_TESTING=2, WIFI_OK=3, WIFI_BAD=4, WIFI_ERROR=5 };
+
+static portMUX_TYPE g_wifiTestMux = portMUX_INITIALIZER_UNLOCKED;
+
+static volatile WifiTestState g_wifiTestState = WIFI_IDLE;
+static volatile int32_t g_wifiRssi = 0;
+static volatile int32_t g_wifiLatencyMs = 0;
+static volatile uint32_t g_wifiSuccess = 0;
+static volatile uint32_t g_wifiFailure = 0;
+
+static String g_wifiTestMsg = "";
+static String g_wifiTestSsid = "";
+static String g_wifiTestPass = "";
+
+static TaskHandle_t g_wifiTestTask = nullptr;
+static volatile bool g_wifiTestRun = false;
+
+// thresholds (tweak later)
+static const int32_t WIFI_OK_LAT_MS  = 200;   // <= this => ok (if connected)
+static const int32_t WIFI_BAD_LAT_MS = 800;   // >= this => bad (if connected)
+static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 12000;
 
 // OTA Globals
 enum : uint8_t {
@@ -318,6 +382,13 @@ RTC_DATA_ATTR bool     g_hasBootedOnce        = false;
 #define UUID_CHR_BLE_EN        0xA00B
 #define UUID_CHR_ADV_INT       0xA00C
 #define UUID_CHR_FW_VERSION    0xA00D
+
+// NEW: Sensor payload (READ, supports chunking via WRITE offset)
+#define UUID_CHR_SENSOR_PAYLOAD ((uint16_t)0xA00E)
+
+// NEW: Wi-Fi test status/control (READ/WRITE)
+#define UUID_CHR_WIFI_TEST     ((uint16_t)0xA00F)
+
 
 // OTA characteristics
 #define UUID_CHR_OTA_CTRL      0xA101
@@ -509,6 +580,9 @@ static inline void setOrNullF(JsonObject obj, const char* key, float value, bool
 static inline void setOrNullI(JsonObject obj, const char* key, int value, bool ok) {
   if (ok) obj[key] = value; else obj[key] = nullptr;
 }
+static inline void setOrNullS(JsonObject obj, const char* key, const char* value, bool ok) {
+  if (ok) obj[key] = value; else obj[key] = nullptr;
+}
 static inline bool validCoord(float lat, float lon) {
   return validF(lat) && validF(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
 }
@@ -579,7 +653,6 @@ static bool scdWaitAndRead(uint32_t timeout_ms = 6500) {
         g_scd_co2  = co2;
         g_scd_temp = t;
         g_scd_rh   = rh;
-        // LOG("[SCD4x] CO₂=%.1f ppm | T=%.2f °C | RH=%.2f %%\n", g_scd_co2, g_scd_temp, g_scd_rh);
         return true;
       }
       LOG("[ERROR] [SCD4x] readMeasurement=0x%04X (co2=%u)\n", (uint16_t)e, co2);
@@ -640,7 +713,6 @@ AnalogSnapshot_t readAdsSnapshot(float &ads_v3v3, float &ads_vbat_div) {
   float moist_pct  = moisturePercentFromMv(moist_mv);
 
   float r_micro = computeSensorResistance(v_3v3, v_micro);
-  float micro_mv = validF(v_micro) ? v_micro * 1000.0f : NAN;
 
   a.vbat_v    = v_bat;
   a.vbat_pct  = bat_pct;
@@ -648,14 +720,6 @@ AnalogSnapshot_t readAdsSnapshot(float &ads_v3v3, float &ads_vbat_div) {
   a.moist_pct = moist_pct;
   a.micro_v   = v_micro;
   a.r_ohms    = r_micro;
-
-  // LOG("[ADS1115] VBAT=%.3f V | BAT=%.1f %% | Moist=%.1f mV | MoistPct=%.1f %% | Micro=%.1f mV | R=%.1f Ω\n",
-      // v_bat,
-      // bat_pct,
-      // moist_mv,
-      // moist_pct,
-      // micro_mv,
-      // r_micro);
 
   return a;
 }
@@ -699,30 +763,18 @@ AnalogSnapshot_t readEspSnapshot(float &esp_vbat_mV, float &esp_moist_mV, float 
   esp_moist_mV = moist_mV;
   esp_micro_mV = micro_mV;
 
-  // LOG("[ESP-ADC] VBAT=%.3f V | BAT=%.1f %% | Moist=%.1f mV | MoistPct=%.1f %% | Micro=%.1f mV | R=%.1f Ω\n",
-  //     vbat_V,
-  //     bat_pct,
-  //     moist_mV,
-  //     moist_pct,
-  //     micro_mV,
-  //     r_micro);
-
   return a;
 }
 
 // ================== DS18B20 SOIL TEMP =================
 static void PrintScratchpad(const DSTherm::Scratchpad& sp) {
-  const uint8_t* b = sp.getRaw();
-  // LOG("[TEMP] SP: %02X %02X %02X %02X %02X %02X %02X %02X %02X | rawTemp=0x%02X%02X\n",
-  //     b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8], b[1], b[0]);
+  (void)sp;
 }
-
-
 
 float getSoilTempC() {
   Placeholder<DSTherm::Scratchpad> sp;
 
-  // Kick conversion for all devices (your library’s known-good call)
+  // Kick conversion for all devices
   tempSensor.convertTempAll(94, true); // blocking
 
   // Read first DS device found
@@ -733,9 +785,8 @@ float getSoilTempC() {
       PrintScratchpad(*sp);
       float t = sp->getTemp2() / 16.0f;
 
-      // 85C is the DS18B20 power-up/default temp register (conversion not applied)
+      // 85C is the DS18B20 power-up/default temp register
       if (fabsf(t - 85.0f) < 0.01f) {
-        // LOG("[TEMP] Got 85C (default). Waiting and retrying...\n");
         delay(1000);
 
         tempSensor.convertTempAll(94, true);
@@ -745,7 +796,6 @@ float getSoilTempC() {
         }
       }
 
-      // LOG("[TEMP] soilTempC=%.2f °C\n", t);
       return t;
     }
   }
@@ -753,9 +803,6 @@ float getSoilTempC() {
   LOG("[ERROR] [TEMP] No valid DS18B20 reading\n");
   return NAN;
 }
-
-
-
 
 // ================== BUILD SENSOR DATA FROM SNAPSHOTS =================
 void buildSensorDataFromSnapshots(SensorData_t &d,
@@ -1014,227 +1061,13 @@ bool readRtcTimeUTC(char *out, size_t len) {
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 1000)) {
     strftime(out, len, "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-    LOG("[Time] RTC: %s\n", out);
     return true;
   }
-  if (len > 0) out[0] = '\0';
+  if (len) out[0] = '\0';
   return false;
 }
 
-bool UploadToCloudOnce(const SensorData_t &d, String &errOut) {
-  errOut = "";
-
-  if (!cfg.wifi_ssid.length()) {
-    errOut = "No Wi-Fi configured";
-    return false;
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    errOut = "Wi-Fi not connected";
-    return false;
-  }
-
-  String featuresJson = buildArcGisFeaturesJson(d);
-  String body = "f=json&rollbackOnFailure=false&features=" + urlEncode(featuresJson);
-  body += "&token=" + urlEncode(ARC_API_KEY);
-  String fullUrl = String(ARC_ENDPOINT) + "?token=" + urlEncode(ARC_API_KEY);
-
-  WiFiClientSecure client; client.setInsecure();
-  HTTPClient http; http.setTimeout(20000);
-
-  bool okHttp=false, okApi=false;
-  String resp;
-
-  if (http.begin(client, fullUrl)) {
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    http.addHeader("Referer", ARC_REFERER);
-    int code = http.POST(body);
-    okHttp = (code >= 200 && code < 300);
-    if (code > 0) resp = http.getString();
-    else errOut = String("HTTP error code ") + code;
-    http.end();
-  } else {
-    errOut = "HTTP begin() failed";
-  }
-
-  if (okHttp && resp.length()) {
-    StaticJsonDocument<1024> doc;
-    DeserializationError derr = deserializeJson(doc, resp);
-    if (!derr) {
-      JsonArray results = doc["addResults"];
-      if (!results.isNull() && results.size() > 0) {
-        okApi = results[0]["success"] | false;
-        if (!okApi) {
-          const char* desc = results[0]["error"]["description"] | "";
-          int code = results[0]["error"]["code"] | 0;
-          errOut = String("ArcGIS addFeatures failed (") + code + "): " + desc;
-        }
-      } else {
-        errOut = "ArcGIS addResults missing/empty";
-      }
-    } else {
-      errOut = String("Cloud JSON parse error: ") + derr.c_str();
-    }
-  }
-
-  WiFi.disconnect(true, true);
-  return okHttp && okApi;
-}
-
-// ================== SD CARD (CSV LOGGING) =================
-void initSD() {
-  pinMode(SD_CD, INPUT_PULLUP);
-  int cd = digitalRead(SD_CD);
-  if (cd == HIGH) {
-    LOG("[ERROR] [SD] No card detected (CD HIGH)\n");
-    g_sd_ok = false;
-    return;
-  }
-
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-
-  if (!SD.begin(SD_CS)) {
-    LOG("[ERROR] [SD] SD.begin failed\n");
-    g_sd_ok = false;
-    return;
-  }
-  g_sd_ok = true;
-}
-
-bool sdAppendSample(const SensorData_t &d) {
-  if (!g_sd_ok) {
-    LOG("[ERROR] [SD] Not initialized, skipping log\n");
-    return false;
-  }
-
-  bool writeHeader = false;
-
-  if (!SD.exists("/DirtData.csv")) {
-    writeHeader = true;
-  }
-
-  File f = SD.open("/DirtData.csv", FILE_APPEND);
-  if (!f) {
-    LOG("[ERROR] [SD] Failed to open DirtData.csv\n");
-    return false;
-  }
-
-  if (f.size() == 0) {
-    writeHeader = true;
-  }
-
-  if (writeHeader) {
-    f.println(
-      "timestamp_utc,"
-      "node_id,"
-      "node_nickname,"
-      "lat_deg,"
-      "lon_deg,"
-      "co2_ppm,"
-      "air_temp_C,"
-      "air_humidity_pct,"
-      "soil_temp_C,"
-      "battery_voltage_V,"
-      "battery_percent_pct,"
-      "soil_moisture_mV,"
-      "soil_moisture_pct,"
-      "micro_voltage_V,"
-      "resistance_ohms,"
-      "ads_v3v3_V,"
-      "ads_moist_V,"
-      "ads_micro_V,"
-      "ads_vbat_div_V,"
-      "esp_vbat_mV,"
-      "esp_moist_mV,"
-      "esp_micro_mV"
-    );
-  }
-
-  if (d.timestampUtc[0] != '\0') f.print(d.timestampUtc);
-  f.print(',');
-
-  f.print(d.nodeId);               f.print(',');
-  f.print(d.nodeName);             f.print(',');
-  f.print(d.latitude, 6);          f.print(',');
-  f.print(d.longitude, 6);         f.print(',');
-  f.print(d.co2PPM, 1);            f.print(',');
-  f.print(d.airTempC, 2);          f.print(',');
-  f.print(d.airHumidity, 2);       f.print(',');
-  f.print(d.soilTempC, 2);         f.print(',');
-  f.print(d.batteryVoltage, 3);    f.print(',');
-  f.print(d.batteryPercent, 1);    f.print(',');
-  f.print(d.soilMoisture_mV, 1);   f.print(',');
-  f.print(d.soilMoisturePercent,1);f.print(',');
-  f.print(d.microVoltage, 4);      f.print(',');
-  f.print(d.resistance, 2);        f.print(',');
-  f.print(d.ads_v3v3, 3);          f.print(',');
-  f.print(d.ads_moist_v, 3);       f.print(',');
-  f.print(d.ads_micro_v, 3);       f.print(',');
-  f.print(d.ads_vbat_div_v, 3);    f.print(',');
-  f.print(d.esp_vbat_mV, 1);       f.print(',');
-  f.print(d.esp_moist_mV, 1);      f.print(',');
-  f.print(d.esp_micro_mV, 1);
-
-  f.println();
-  f.close();
-
-  LOG("[SD] Data posted\n");
-  return true;
-}
-
-// ================== SLEEP =================
-void SleepSeconds(uint32_t seconds) {
-  if (seconds == 0) seconds = 1;
-  uint64_t us = (uint64_t)seconds * 1000000ULL;
-  LOG("[Run] Complete, sleeping %lu s\n", (unsigned long)seconds);
-  esp_sleep_enable_timer_wakeup(us);
-  esp_deep_sleep_start();
-}
-
-// (optional: keep for compatibility, now just wraps SleepSeconds)
-void SleepMinutes(uint32_t minutes) {
-  SleepSeconds(minutes * 60UL);
-}
-
-
-// ================== CONFIG LOAD / FACTORY RESET =================
-void loadPrefs() {
-  prefs.begin("dirtdata", false);
-  cfg.nickname     = prefs.getString("nickname", "");
-  cfg.lat          = prefs.getString("lat", "");
-  cfg.lon          = prefs.getString("lon", "");
-  cfg.interval_min = prefs.getUInt("interval_min", DEFAULT_SAMPLE_INTERVAL_MIN);
-  if (cfg.interval_min == 0) cfg.interval_min = DEFAULT_SAMPLE_INTERVAL_MIN;
-  cfg.wifi_ssid    = prefs.getString("wifi_ssid", "");
-  cfg.wifi_pass    = prefs.getString("wifi_pass", "");
-
-  cfg.timestamp_iso       = prefs.getString("ts_iso", "");
-  cfg.sd_enable           = prefs.getUChar("sd_en",   1);
-  cfg.wifi_enable         = prefs.getUChar("wifi_en", 1);
-  cfg.ble_enable          = prefs.getUChar("ble_en",  1);
-  cfg.ble_adv_interval_sec= prefs.getUInt("ble_adv_sec", DEFAULT_BLE_ADV_INTERVAL_SEC);
-  if (cfg.ble_adv_interval_sec == 0) cfg.ble_adv_interval_sec = DEFAULT_BLE_ADV_INTERVAL_SEC;
-  prefs.end();
-}
-
-void factoryResetConfig() {
-  LOG("[Factory] Resetting preferences\n");
-  prefs.begin("dirtdata", false);
-  prefs.clear();
-  prefs.end();
-
-  cfg.nickname = "";
-  cfg.lat = "";
-  cfg.lon = "";
-  cfg.interval_min = DEFAULT_SAMPLE_INTERVAL_MIN;
-  cfg.wifi_ssid = "";
-  cfg.wifi_pass = "";
-  cfg.timestamp_iso = "";
-  cfg.sd_enable = true;
-  cfg.wifi_enable = true;
-  cfg.ble_enable = true;
-  cfg.ble_adv_interval_sec = DEFAULT_BLE_ADV_INTERVAL_SEC;
-}
-
+   
 // ================== BLE CALLBACKS =================
 void dumpCfgForDebug() {
   LOG("[CFG] Dump (after BLE write):\n");
@@ -1386,6 +1219,366 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+static int32_t TcpLatencyMs(const char* host, uint16_t port, uint32_t timeoutMs) {
+  WiFiClient client;
+  client.setTimeout(timeoutMs / 1000); // coarse, connect uses lwIP timeouts too
+
+  uint32_t t0 = millis();
+  bool ok = client.connect(host, port, timeoutMs);
+  uint32_t dt = millis() - t0;
+
+  if (ok) client.stop();
+  if (!ok) return -1;
+  return (int32_t)dt;
+}
+
+static const char* WifiStateToStr(WifiTestState s) {
+  switch (s) {
+    case WIFI_CONNECTING: return "testing";
+    case WIFI_TESTING:    return "testing";
+    case WIFI_OK:         return "ok";
+    case WIFI_BAD:        return "bad";
+    case WIFI_ERROR:      return "error";
+    default:              return "error";
+  }
+}
+
+static std::string BuildWifiTestStatusJson() {
+  WifiTestState st;
+  int32_t rssi, lat;
+  uint32_t okc, failc;
+  String msg;
+
+  portENTER_CRITICAL(&g_wifiTestMux);
+  st = g_wifiTestState;
+  rssi = g_wifiRssi;
+  lat  = g_wifiLatencyMs;
+  okc  = g_wifiSuccess;
+  failc= g_wifiFailure;
+  msg  = g_wifiTestMsg;
+  portEXIT_CRITICAL(&g_wifiTestMux);
+
+  StaticJsonDocument<256> doc;
+  doc["state"] = WifiStateToStr(st);
+
+  // Keep keys exactly as your app expects
+  if (st == WIFI_IDLE) {
+    doc["state"] = "error";
+    doc["message"] = "idle";
+  }
+
+  if (WiFi.status() == WL_CONNECTED) doc["rssi"] = rssi; else doc["rssi"] = nullptr;
+
+  if (lat >= 0) doc["latencyMs"] = lat; else doc["latencyMs"] = nullptr;
+
+  doc["successCount"] = okc;
+  doc["failureCount"] = failc;
+
+  if (msg.length()) doc["message"] = msg;
+
+  String out;
+  serializeJson(doc, out);
+  return std::string(out.c_str(), out.length());
+}
+
+static void WifiTestStopInternal() {
+  g_wifiTestRun = false;
+  if (g_wifiTestTask) {
+    TaskHandle_t t = g_wifiTestTask;
+    g_wifiTestTask = nullptr;
+    vTaskDelete(t);
+  }
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+
+  portENTER_CRITICAL(&g_wifiTestMux);
+  g_wifiTestState = WIFI_IDLE;
+  g_wifiTestMsg = "stopped";
+  portEXIT_CRITICAL(&g_wifiTestMux);
+}
+
+static void WifiTestTask(void* arg) {
+  (void)arg;
+
+  // mark connecting
+  portENTER_CRITICAL(&g_wifiTestMux);
+  g_wifiTestState = WIFI_CONNECTING;
+  g_wifiTestMsg = "connecting";
+  g_wifiLatencyMs = -1;
+  g_wifiRssi = 0;
+  portEXIT_CRITICAL(&g_wifiTestMux);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false); // more stable for latency testing
+  WiFi.begin(g_wifiTestSsid.c_str(), g_wifiTestPass.c_str());
+
+  uint32_t t0 = millis();
+  while (g_wifiTestRun && WiFi.status() != WL_CONNECTED && (millis() - t0) < WIFI_CONNECT_TIMEOUT_MS) {
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+  if (!g_wifiTestRun) {
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    portENTER_CRITICAL(&g_wifiTestMux);
+    g_wifiTestState = WIFI_ERROR;
+    g_wifiTestMsg = "wifi connect failed";
+    portEXIT_CRITICAL(&g_wifiTestMux);
+    // keep running until stop, but nothing to test
+    while (g_wifiTestRun) vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  portENTER_CRITICAL(&g_wifiTestMux);
+  g_wifiTestState = WIFI_TESTING;
+  g_wifiTestMsg = "testing";
+  portEXIT_CRITICAL(&g_wifiTestMux);
+
+  // Continuous test loop
+  while (g_wifiTestRun) {
+    if (WiFi.status() != WL_CONNECTED) {
+      portENTER_CRITICAL(&g_wifiTestMux);
+      g_wifiTestState = WIFI_ERROR;
+      g_wifiTestMsg = "disconnected";
+      g_wifiLatencyMs = -1;
+      portEXIT_CRITICAL(&g_wifiTestMux);
+
+      // attempt reconnect
+      WiFi.disconnect(false, false);
+      WiFi.begin(g_wifiTestSsid.c_str(), g_wifiTestPass.c_str());
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    int32_t rssi = WiFi.RSSI();
+
+    // "Ping" using TCP connect timing to a stable endpoint
+    int32_t lat = TcpLatencyMs("1.1.1.1", 443, 1000);
+
+    portENTER_CRITICAL(&g_wifiTestMux);
+    g_wifiRssi = rssi;
+    g_wifiLatencyMs = lat;
+
+    if (lat >= 0) g_wifiSuccess++; else g_wifiFailure++;
+
+    // verdict rules
+    if (lat >= 0 && lat <= WIFI_OK_LAT_MS) {
+      g_wifiTestState = WIFI_OK;
+      g_wifiTestMsg = "";
+    } else if (lat >= 0 && lat >= WIFI_BAD_LAT_MS) {
+      g_wifiTestState = WIFI_BAD;
+      g_wifiTestMsg = "";
+    } else if (lat >= 0) {
+      g_wifiTestState = WIFI_TESTING; // in-between
+      g_wifiTestMsg = "";
+    } else {
+      g_wifiTestState = WIFI_BAD; // failed measurement counts as "bad"
+      g_wifiTestMsg = "tcp probe failed";
+    }
+    portEXIT_CRITICAL(&g_wifiTestMux);
+
+    vTaskDelay(pdMS_TO_TICKS(1500));
+  }
+
+  vTaskDelete(nullptr);
+}
+
+class WifiTestCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
+    (void)connInfo;
+    std::string v = c->getValue();
+    if (v.empty()) return;
+
+    // Parse JSON
+    StaticJsonDocument<256> doc;
+    DeserializationError err = deserializeJson(doc, v.data(), v.size());
+    if (err) {
+      portENTER_CRITICAL(&g_wifiTestMux);
+      g_wifiTestState = WIFI_ERROR;
+      g_wifiTestMsg = "bad json";
+      portEXIT_CRITICAL(&g_wifiTestMux);
+      return;
+    }
+
+    const char* action = doc["action"] | "";
+    if (!strcmp(action, "stop")) {
+      WifiTestStopInternal();
+      return;
+    }
+
+    if (!strcmp(action, "start")) {
+      const char* ssid = doc["ssid"] | "";
+      const char* pass = doc["password"] | "";
+
+      g_wifiTestSsid = String(ssid);
+      g_wifiTestPass = String(pass);
+
+      // reset counters + state
+      portENTER_CRITICAL(&g_wifiTestMux);
+      g_wifiSuccess = 0;
+      g_wifiFailure = 0;
+      g_wifiLatencyMs = -1;
+      g_wifiRssi = 0;
+      g_wifiTestState = WIFI_CONNECTING;
+      g_wifiTestMsg = "starting";
+      portEXIT_CRITICAL(&g_wifiTestMux);
+
+      // stop any existing
+      if (g_wifiTestTask) {
+        g_wifiTestRun = false;
+        vTaskDelay(pdMS_TO_TICKS(50));
+        TaskHandle_t t = g_wifiTestTask;
+        g_wifiTestTask = nullptr;
+        vTaskDelete(t);
+      }
+
+      g_wifiTestRun = true;
+      xTaskCreate(
+        WifiTestTask,
+        "wifi_test",
+        4096,
+        nullptr,
+        1,
+        &g_wifiTestTask
+      );
+
+      return;
+    }
+
+    portENTER_CRITICAL(&g_wifiTestMux);
+    g_wifiTestState = WIFI_ERROR;
+    g_wifiTestMsg = "unknown action";
+    portEXIT_CRITICAL(&g_wifiTestMux);
+  }
+
+  void onRead(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
+    (void)connInfo;
+    std::string out = BuildWifiTestStatusJson();
+    c->setValue((uint8_t*)out.data(), out.size());
+  }
+};
+
+/*******************************************************************
+ * NEW: BLE Callbacks – Sensor Payload characteristic (0xA00E)
+ *
+ * Chunk protocol:
+ *   - Client writes 4 bytes LE "offset" to this same characteristic.
+ *   - Client reads the characteristic:
+ *        returns [total_len(uint32 LE), offset(uint32 LE), data...]
+ *
+ * Fresh sample behavior:
+ *   - If current offset == 0 at the moment of READ:
+ *        triggers a fresh sensor sample and caches JSON.
+ *   - If offset > 0:
+ *        returns subsequent chunks from the cached JSON (no re-sample).
+ *******************************************************************/
+class SensorPayloadCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
+    (void)c; (void)connInfo;
+    std::string v = c->getValue();
+    if (v.size() >= 4) {
+      uint32_t off =
+        (uint8_t)v[0] |
+        ((uint8_t)v[1] << 8) |
+        ((uint8_t)v[2] << 16) |
+        ((uint8_t)v[3] << 24);
+      g_payloadOffset = off;
+      // If app sets offset=0, next read triggers fresh sample.
+      // If app sets offset beyond length, read will return empty chunk.
+      LOG("[BLE][PAYLOAD] offset set to %u\n", (unsigned)g_payloadOffset);
+    } else if (v.size() == 0) {
+      // ignore
+    } else {
+      LOG("[BLE][PAYLOAD] offset write too small (%u bytes)\n", (unsigned)v.size());
+    }
+  }
+
+  void onRead(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
+    LOG("[BLE][PAYLOAD] onRead called\n");
+
+    // Determine max bytes we can return for this read
+    uint16_t mtu = connInfo.getMTU();
+    if (mtu < 23) mtu = 23;
+    uint16_t attMax = (mtu > 3) ? (mtu - 3) : 20;
+
+    const uint16_t kHeaderLen = 8; // total_len (4) + offset (4)
+    uint16_t maxChunk = 0;
+    if (attMax > kHeaderLen) maxChunk = (uint16_t)(attMax - kHeaderLen);
+
+    // HARD CAP to avoid NimBLE attr len limit (~512)
+    if (maxChunk > 504) maxChunk = 504;
+
+
+    // Trigger fresh sample only when offset==0
+    if (g_payloadOffset == 0) {
+      LOG("[BLE][PAYLOAD] Read @offset=0 -> taking fresh sample...\n");
+
+      SensorData_t fresh{};
+      SensorStatus_t status{};
+      TakeFreshSensorSample(fresh, status);
+
+      g_lastStatus = status;   // cache for JSON builder
+
+      g_payloadJson = BuildSensorDataJson(fresh);
+      g_payloadTotalLen = (uint32_t)g_payloadJson.size();
+      g_payloadValid = true;
+
+      LOG("[BLE][PAYLOAD] Fresh payload built, len=%u (scd=%s ds=%s ads=%s)\n",
+          (unsigned)g_payloadTotalLen,
+          status.scd_ok     ? "OK" : "FAIL",
+          status.ds18b20_ok ? "OK" : "FAIL",
+          status.ads_ok     ? "OK" : "FAIL");
+    } else {
+      if (!g_payloadValid) {
+        // If someone tries reading offset>0 without priming, force an empty payload
+        g_payloadJson.clear();
+        g_payloadTotalLen = 0;
+        g_payloadValid = true;
+        LOG("[BLE][PAYLOAD] Read @offset>0 but no cached payload; returning empty\n");
+      }
+    }
+
+    uint32_t totalLen = g_payloadTotalLen;
+    uint32_t off      = g_payloadOffset;
+
+    if (off > totalLen) off = totalLen;
+
+    uint32_t remaining = totalLen - off;
+    uint32_t chunkLen = remaining;
+    if (chunkLen > maxChunk) chunkLen = maxChunk;
+
+    // Build response: header + chunk bytes
+    std::string out;
+    out.resize((size_t)kHeaderLen + (size_t)chunkLen);
+
+    // total_len LE
+    out[0] = (char)(totalLen & 0xFF);
+    out[1] = (char)((totalLen >> 8) & 0xFF);
+    out[2] = (char)((totalLen >> 16) & 0xFF);
+    out[3] = (char)((totalLen >> 24) & 0xFF);
+
+    // offset LE
+    out[4] = (char)(off & 0xFF);
+    out[5] = (char)((off >> 8) & 0xFF);
+    out[6] = (char)((off >> 16) & 0xFF);
+    out[7] = (char)((off >> 24) & 0xFF);
+
+    if (chunkLen > 0) {
+      memcpy(&out[kHeaderLen], g_payloadJson.data() + off, chunkLen);
+    }
+
+    c->setValue((uint8_t*)out.data(), out.size());
+    std::string chk = c->getValue();
+    LOG("[BLE][PAYLOAD] setValue done, storedLen=%u\n", (unsigned)chk.size());
+
+    LOG("[BLE][PAYLOAD] Read resp: mtu=%u attMax=%u off=%u chunk=%u total=%u\n",
+        (unsigned)mtu, (unsigned)attMax, (unsigned)off, (unsigned)chunkLen, (unsigned)totalLen);
+  }
+};
+
 /*******************************************************************
  * BLE Callbacks – Control characteristic
  *
@@ -1401,7 +1594,6 @@ class ConfigCharCallbacks : public NimBLECharacteristicCallbacks {
  *     [1..4] = bytesWritten (uint32_t, little-endian)
  *     [5..8] = lastError (esp_err_t, little-endian)
  *******************************************************************/
-
 class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     (void)connInfo;
@@ -1426,7 +1618,7 @@ class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
 
       if (s_ota.status == OTA_STATUS_FINISHED) {
         LOG("[OTA] OTA finished OK, rebooting into new firmware...\n");
-        vTaskDelay(pdMS_TO_TICKS(200));   // small delay for logs / BLE to flush
+        vTaskDelay(pdMS_TO_TICKS(200));
         esp_restart();
       } else {
         LOG("[OTA] CMD_FINISH: OTA not in FINISHED state (status=%u, err=%d)\n",
@@ -1443,7 +1635,7 @@ class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
         LOG("[OTA] CMD_REBOOT\n");
         if (s_ota.status == OTA_STATUS_FINISHED) {
           LOG("[OTA] Rebooting into new firmware...\n");
-          vTaskDelay(pdMS_TO_TICKS(100)); // small delay to allow log flush
+          vTaskDelay(pdMS_TO_TICKS(100));
           esp_restart();
         } else {
           LOG("[OTA] Reboot requested but OTA not in FINISHED state (status=%u)\n", s_ota.status);
@@ -1479,27 +1671,11 @@ class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
-/*******************************************************************
- * BLE Callbacks – Data characteristic
- *
- * App should:
- *   1) Write CMD_START to control char
- *   2) Stream firmware in chunks to data char
- *   3) Write CMD_FINISH to control char
- *   4) Optionally read control char to confirm status
- *   5) Write CMD_REBOOT to control char to reboot into new image
- *******************************************************************/
-
 class OtaDataCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     (void)connInfo;
     std::string data = c->getValue();
-    // LOG("[OTA] Data chunk, len=%u\n", (unsigned)data.size());
-
-    if (data.empty()) {
-      return;
-    }
-
+    if (data.empty()) return;
     OtaFeed(reinterpret_cast<const uint8_t*>(data.data()), data.size());
   }
 };
@@ -1533,12 +1709,12 @@ void InitRuntimeBle() {
   }
 
   LOG("[BLE] Initializing runtime BLE server\n");
-  // LOG("[BLE] Free heap at start: %u bytes\n", (unsigned)esp_get_free_heap_size());
 
   String devName = "BioSensor-DirtDataN-" + macLast4();
 
   NimBLEDevice::init(devName.c_str());
-  NimBLEDevice::setMTU(517); 
+  NimBLEDevice::setMTU(515);
+
   NimBLEDevice::setDeviceName(devName.c_str());
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
@@ -1546,9 +1722,7 @@ void InitRuntimeBle() {
   g_runtimeServer->setCallbacks(new RuntimeBleServerCallbacks());
 
   // -------- CONFIG SERVICE --------
-  // LOG("[BLE] Starting config service (chars=13)\n");
   NimBLEService* cfgSvc = g_runtimeServer->createService(NimBLEUUID((uint16_t)UUID_SVC_CONFIG));
-  // LOG("[BLE] cfgSvc handle=%u\n", (unsigned)cfgSvc->getHandle());
 
   auto mkCharCfg = [&](uint16_t uuid16, uint32_t props) {
     NimBLECharacteristic* c = cfgSvc->createCharacteristic(uuid16, props);
@@ -1556,8 +1730,8 @@ void InitRuntimeBle() {
       LOG("[BLE][CFG] ERROR creating char 0x%04X\n", uuid16);
       return (NimBLECharacteristic*)nullptr;
     }
+    // Default config callbacks (writes)
     c->setCallbacks(new ConfigCharCallbacks());
-    // LOG("[BLE][CFG] char ok: 0x%04X handle=%u\n", uuid16, (unsigned)c->getHandle());
     return c;
   };
 
@@ -1590,6 +1764,34 @@ void InitRuntimeBle() {
   g_charFwVersion = mkCharCfg(UUID_CHR_FW_VERSION,
                               NIMBLE_PROPERTY::READ);
 
+  // NEW: Sensor payload characteristic (READ + WRITE for offset)
+  static constexpr uint16_t SENSOR_PAYLOAD_MAX_LEN = 1024;
+
+  g_charSensorPayload = cfgSvc->createCharacteristic(
+      NimBLEUUID((uint16_t)UUID_CHR_SENSOR_PAYLOAD),
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE
+  );
+
+  // Force the underlying attribute value to allocate a buffer
+  static const uint8_t kEmpty[1] = {0};
+  g_charSensorPayload->setValue(NimBLEAttValue(kEmpty, 0, SENSOR_PAYLOAD_MAX_LEN));
+
+
+  g_charSensorPayload->setCallbacks(new SensorPayloadCallbacks());
+
+    // NEW: Wi-Fi test characteristic (READ/WRITE)
+  g_charWifiTest = cfgSvc->createCharacteristic(
+      NimBLEUUID((uint16_t)UUID_CHR_WIFI_TEST),
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE
+  );
+  g_charWifiTest->setCallbacks(new WifiTestCallbacks());
+
+  // prime value (small)
+  {
+    const char* s = "{\"state\":\"error\",\"message\":\"idle\",\"successCount\":0,\"failureCount\":0}";
+    g_charWifiTest->setValue((uint8_t*)s, strlen(s));
+  }
+
   if (!cfgSvc->start()) {
     LOG("[BLE] ERROR: cfgSvc->start() failed!\n");
   } else {
@@ -1597,9 +1799,7 @@ void InitRuntimeBle() {
   }
 
   // -------- OTA SERVICE --------
-  // LOG("[BLE] Starting OTA service (chars=2)\n");
   NimBLEService* otaSvc = g_runtimeServer->createService(NimBLEUUID((uint16_t)UUID_SVC_OTA));
-  // LOG("[BLE] otaSvc handle=%u\n", (unsigned)otaSvc->getHandle());
 
   auto mkCharOta = [&](uint16_t uuid16, uint32_t props, NimBLECharacteristicCallbacks* cb) {
     NimBLECharacteristic* c = otaSvc->createCharacteristic(uuid16, props);
@@ -1608,7 +1808,6 @@ void InitRuntimeBle() {
       return (NimBLECharacteristic*)nullptr;
     }
     c->setCallbacks(cb);
-    // LOG("[BLE][OTA] char ok: 0x%04X handle=%u\n", uuid16, (unsigned)c->getHandle());
     return c;
   };
 
@@ -1704,7 +1903,7 @@ void RunRuntimeBleWindowOrSession() {
   g_runtimeClientConnected     = false;
   g_runtimeClientEverConnected = false;
 
-  const uint32_t advWindowMs = DEFAULT_BLE_ADV_WINDOW_MS; // 3s advertise window when NO connection
+  const uint32_t advWindowMs = DEFAULT_BLE_ADV_WINDOW_MS; // advertise window when NO connection
   const uint32_t pollMs      = 100;
 
   LOG("[BLE] Starting runtime advertising window (%lu ms, then sleep if no connection)\n",
@@ -1714,17 +1913,11 @@ void RunRuntimeBleWindowOrSession() {
   uint32_t start = millis();
 
   while (true) {
-    // If app committed config, we reboot inside the commit handler (esp_restart)
-    // so we don't need an explicit check here.
-
     if (g_runtimeClientEverConnected) {
-      // We are in "config session" mode: stay awake, keep advertising, wait on app.
-      // No timeout here; commit write will reboot.
       delay(pollMs);
       continue;
     }
 
-    // No client has ever connected during this boot: enforce adv window.
     if (millis() - start >= advWindowMs) {
       LOG("[BLE] Runtime adv window expired, no connection; stopping BLE\n");
       g_runtimeAdvertising->stop();
@@ -1741,6 +1934,360 @@ bool bootButtonHeld() {
   delay(10);
   return digitalRead(BOOT_BTN)==LOW;
 }
+
+// ================== SD CARD (CSV LOGGING) =================
+void initSD() {
+  pinMode(SD_CD, INPUT_PULLUP);
+  int cd = digitalRead(SD_CD);
+  if (cd == HIGH) {
+    LOG("[ERROR] [SD] No card detected (CD HIGH)\n");
+    g_sd_ok = false;
+    return;
+  }
+
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+
+  if (!SD.begin(SD_CS)) {
+    LOG("[ERROR] [SD] SD.begin failed\n");
+    g_sd_ok = false;
+    return;
+  }
+  g_sd_ok = true;
+}
+
+bool sdAppendSample(const SensorData_t &d) {
+  if (!g_sd_ok) {
+    LOG("[ERROR] [SD] Not initialized, skipping log\n");
+    return false;
+  }
+
+  bool writeHeader = false;
+
+  if (!SD.exists("/DirtData.csv")) {
+    writeHeader = true;
+  }
+
+  File f = SD.open("/DirtData.csv", FILE_APPEND);
+  if (!f) {
+    LOG("[ERROR] [SD] Failed to open DirtData.csv\n");
+    return false;
+  }
+
+  if (f.size() == 0) {
+    writeHeader = true;
+  }
+
+  if (writeHeader) {
+    f.println(
+      "timestamp_utc,"
+      "node_id,"
+      "node_nickname,"
+      "lat_deg,"
+      "lon_deg,"
+      "co2_ppm,"
+      "air_temp_C,"
+      "air_humidity_pct,"
+      "soil_temp_C,"
+      "battery_voltage_V,"
+      "battery_percent_pct,"
+      "soil_moisture_mV,"
+      "soil_moisture_pct,"
+      "micro_voltage_V,"
+      "resistance_ohms,"
+      "ads_v3v3_V,"
+      "ads_moist_V,"
+      "ads_micro_V,"
+      "ads_vbat_div_V,"
+      "esp_vbat_mV,"
+      "esp_moist_mV,"
+      "esp_micro_mV"
+    );
+  }
+
+  if (d.timestampUtc[0] != '\0') f.print(d.timestampUtc);
+  f.print(',');
+
+  f.print(d.nodeId);               f.print(',');
+  f.print(d.nodeName);             f.print(',');
+  f.print(d.latitude, 6);          f.print(',');
+  f.print(d.longitude, 6);         f.print(',');
+  f.print(d.co2PPM, 1);            f.print(',');
+  f.print(d.airTempC, 2);          f.print(',');
+  f.print(d.airHumidity, 2);       f.print(',');
+  f.print(d.soilTempC, 2);         f.print(',');
+  f.print(d.batteryVoltage, 3);    f.print(',');
+  f.print(d.batteryPercent, 1);    f.print(',');
+  f.print(d.soilMoisture_mV, 1);   f.print(',');
+  f.print(d.soilMoisturePercent,1);f.print(',');
+  f.print(d.microVoltage, 4);      f.print(',');
+  f.print(d.resistance, 2);        f.print(',');
+  f.print(d.ads_v3v3, 3);          f.print(',');
+  f.print(d.ads_moist_v, 3);       f.print(',');
+  f.print(d.ads_micro_v, 3);       f.print(',');
+  f.print(d.ads_vbat_div_v, 3);    f.print(',');
+  f.print(d.esp_vbat_mV, 1);       f.print(',');
+  f.print(d.esp_moist_mV, 1);      f.print(',');
+  f.print(d.esp_micro_mV, 1);
+
+  f.println();
+  f.close();
+
+  LOG("[SD] Data posted\n");
+  return true;
+}
+
+// ================== SLEEP =================
+void SleepSeconds(uint32_t seconds) {
+  if (seconds == 0) seconds = 1;
+  uint64_t us = (uint64_t)seconds * 1000000ULL;
+  LOG("[Run] Complete, sleeping %lu s\n", (unsigned long)seconds);
+  esp_sleep_enable_timer_wakeup(us);
+  esp_deep_sleep_start();
+}
+
+void SleepMinutes(uint32_t minutes) {
+  SleepSeconds(minutes * 60UL);
+}
+
+// ================== CONFIG LOAD / FACTORY RESET =================
+void loadPrefs() {
+  prefs.begin("dirtdata", false);
+  cfg.nickname     = prefs.getString("nickname", "");
+  cfg.lat          = prefs.getString("lat", "");
+  cfg.lon          = prefs.getString("lon", "");
+  cfg.interval_min = prefs.getUInt("interval_min", DEFAULT_SAMPLE_INTERVAL_MIN);
+  if (cfg.interval_min == 0) cfg.interval_min = DEFAULT_SAMPLE_INTERVAL_MIN;
+  cfg.wifi_ssid    = prefs.getString("wifi_ssid", "");
+  cfg.wifi_pass    = prefs.getString("wifi_pass", "");
+
+  cfg.timestamp_iso       = prefs.getString("ts_iso", "");
+  cfg.sd_enable           = prefs.getUChar("sd_en",   1);
+  cfg.wifi_enable         = prefs.getUChar("wifi_en", 1);
+  cfg.ble_enable          = prefs.getUChar("ble_en",  1);
+  cfg.ble_adv_interval_sec= prefs.getUInt("ble_adv_sec", DEFAULT_BLE_ADV_INTERVAL_SEC);
+  if (cfg.ble_adv_interval_sec == 0) cfg.ble_adv_interval_sec = DEFAULT_BLE_ADV_INTERVAL_SEC;
+  prefs.end();
+}
+
+void factoryResetConfig() {
+  LOG("[Factory] Resetting preferences\n");
+  prefs.begin("dirtdata", false);
+  prefs.clear();
+  prefs.end();
+
+  cfg.nickname = "";
+  cfg.lat = "";
+  cfg.lon = "";
+  cfg.interval_min = DEFAULT_SAMPLE_INTERVAL_MIN;
+  cfg.wifi_ssid = "";
+  cfg.wifi_pass = "";
+  cfg.timestamp_iso = "";
+  cfg.sd_enable = true;
+  cfg.wifi_enable = true;
+  cfg.ble_enable = true;
+  cfg.ble_adv_interval_sec = DEFAULT_BLE_ADV_INTERVAL_SEC;
+}
+
+// ================== CLOUD UPLOAD =================
+bool UploadToCloudOnce(const SensorData_t &d, String &errOut) {
+  errOut = "";
+
+  if (!cfg.wifi_ssid.length()) {
+    errOut = "No Wi-Fi configured";
+    return false;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    errOut = "Wi-Fi not connected";
+    return false;
+  }
+
+  String featuresJson = buildArcGisFeaturesJson(d);
+  String body = "f=json&rollbackOnFailure=false&features=" + urlEncode(featuresJson);
+  body += "&token=" + urlEncode(ARC_API_KEY);
+  String fullUrl = String(ARC_ENDPOINT) + "?token=" + urlEncode(ARC_API_KEY);
+
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http; http.setTimeout(20000);
+
+  bool okHttp=false, okApi=false;
+  String resp;
+
+  if (http.begin(client, fullUrl)) {
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    http.addHeader("Referer", ARC_REFERER);
+    int code = http.POST(body);
+    okHttp = (code >= 200 && code < 300);
+    if (code > 0) resp = http.getString();
+    else errOut = String("HTTP error code ") + code;
+    http.end();
+  } else {
+    errOut = "HTTP begin() failed";
+  }
+
+  if (okHttp && resp.length()) {
+    StaticJsonDocument<1024> doc;
+    DeserializationError derr = deserializeJson(doc, resp);
+    if (!derr) {
+      JsonArray results = doc["addResults"];
+      if (!results.isNull() && results.size() > 0) {
+        okApi = results[0]["success"] | false;
+        if (!okApi) {
+          const char* desc = results[0]["error"]["description"] | "";
+          int code = results[0]["error"]["code"] | 0;
+          errOut = String("ArcGIS addFeatures failed (") + code + "): " + desc;
+        }
+      } else {
+        errOut = "ArcGIS addResults missing/empty";
+      }
+    } else {
+      errOut = String("Cloud JSON parse error: ") + derr.c_str();
+    }
+  }
+
+  WiFi.disconnect(true, true);
+  return okHttp && okApi;
+}
+
+// ================== NEW: Sensor payload JSON builder =================
+static std::string BuildSensorDataJson(const SensorData_t &d) {
+  // Keep this reasonably sized; SensorData_t is modest.
+  StaticJsonDocument<1024> doc;
+  JsonObject o = doc.to<JsonObject>();
+
+  // Helpers
+  auto okf = [](float v){ return isfinite(v); };
+  auto oki = [](int32_t v){ (void)v; return true; };
+
+    // ---- Status block (always present) ----
+  JsonObject st = o.createNestedObject("status");
+  st["scd_ok"]     = g_lastStatus.scd_ok;
+  st["ds18b20_ok"] = g_lastStatus.ds18b20_ok;
+  st["ads_ok"]     = g_lastStatus.ads_ok;
+
+
+  setOrNullI(o, "nodeId", (int)d.nodeId, oki(d.nodeId));
+  setOrNullS(o, "timestampUtc", d.timestampUtc, (d.timestampUtc[0] != '\0'));
+
+  // coords
+  setOrNullF(o, "latitude",  d.latitude,  okf(d.latitude));
+  setOrNullF(o, "longitude", d.longitude, okf(d.longitude));
+
+  // SCD4x
+  setOrNullF(o, "co2PPM",      d.co2PPM,      okf(d.co2PPM));
+  setOrNullF(o, "airTempC",    d.airTempC,    okf(d.airTempC));
+  setOrNullF(o, "airHumidity", d.airHumidity, okf(d.airHumidity));
+
+  // Soil temp
+  setOrNullF(o, "soilTempC", d.soilTempC, okf(d.soilTempC));
+
+  // Battery
+  setOrNullF(o, "batteryVoltage", d.batteryVoltage, okf(d.batteryVoltage));
+  setOrNullF(o, "batteryPercent", d.batteryPercent, okf(d.batteryPercent));
+
+  // Moisture
+  setOrNullF(o, "soilMoisture_mV",     d.soilMoisture_mV,     okf(d.soilMoisture_mV));
+  setOrNullF(o, "soilMoisturePercent", d.soilMoisturePercent, okf(d.soilMoisturePercent));
+
+  // Microbial
+  setOrNullF(o, "microVoltage", d.microVoltage, okf(d.microVoltage));
+  setOrNullF(o, "resistance",   d.resistance,   okf(d.resistance));
+
+  // ADS raw
+  setOrNullF(o, "ads_v3v3",       d.ads_v3v3,       okf(d.ads_v3v3));
+  setOrNullF(o, "ads_moist_v",    d.ads_moist_v,    okf(d.ads_moist_v));
+  setOrNullF(o, "ads_micro_v",    d.ads_micro_v,    okf(d.ads_micro_v));
+  setOrNullF(o, "ads_vbat_div_v", d.ads_vbat_div_v, okf(d.ads_vbat_div_v));
+
+  // ESP raw
+  setOrNullF(o, "esp_vbat_mV",  d.esp_vbat_mV,  okf(d.esp_vbat_mV));
+  setOrNullF(o, "esp_moist_mV", d.esp_moist_mV, okf(d.esp_moist_mV));
+  setOrNullF(o, "esp_micro_mV", d.esp_micro_mV, okf(d.esp_micro_mV));
+
+  // name
+  setOrNullS(o, "nodeName", d.nodeName, (d.nodeName[0] != '\0'));
+
+  std::string out;
+  out.reserve(512);
+  String s;
+  serializeJson(doc, s);
+  out.assign(s.c_str(), s.length());
+  return out;
+}
+
+// ================== NEW: Take fresh sample for BLE read =================
+static bool TakeFreshSensorSample(SensorData_t &out, SensorStatus_t &status) {
+  // Always returns true once payload is produced.
+  bool ok = true;
+
+  status = {};
+  status.scd_ok     = false;
+  status.ds18b20_ok = false;
+  status.ads_ok     = false;
+
+  digitalWrite(ESP_PWR_3V3, HIGH);
+  delay(250);
+
+  // Reset globals
+  g_scd_present = false;
+  g_scd_running = false;
+  g_scd_co2 = g_scd_temp = g_scd_rh = NAN;
+  g_ads_present = false;
+  g_ads_v3v3 = NAN;
+
+  // Init sensors
+  g_scd_present = scdInitRobust();
+  g_ads_present = adsInit();
+  status.ads_ok = g_ads_present;
+
+  LowPowerWaitMs(100);
+
+  status.scd_ok = scdWaitAndRead(6500);
+
+  float ads_v3v3     = NAN;
+  float ads_vbat_div = NAN;
+  float esp_vbat_mV  = NAN;
+  float esp_moist_mV = NAN;
+  float esp_micro_mV = NAN;
+
+  AnalogSnapshot_t adsSnap = readAdsSnapshot(ads_v3v3, ads_vbat_div);
+  AnalogSnapshot_t espSnap = readEspSnapshot(esp_vbat_mV, esp_moist_mV, esp_micro_mV);
+
+  float soilTempC = getSoilTempC();
+  status.ds18b20_ok = validF(soilTempC);
+
+  buildSensorDataFromSnapshots(out,
+                               adsSnap,
+                               espSnap,
+                               ads_v3v3,
+                               ads_vbat_div,
+                               esp_vbat_mV,
+                               esp_moist_mV,
+                               esp_micro_mV,
+                               soilTempC);
+
+  // Timestamp (RTC first, then WiFi if allowed)
+  bool gotTime = false;
+  if (readRtcTimeUTC(out.timestampUtc, sizeof(out.timestampUtc))) {
+    gotTime = true;
+  } else {
+    out.timestampUtc[0] = '\0';
+  }
+
+  if (!gotTime && cfg.wifi_enable && cfg.wifi_ssid.length()) {
+    if (connectWiFiSTA(cfg.wifi_ssid, cfg.wifi_pass, 10000)) {
+      gotTime = fetchTimeUTC(out.timestampUtc, sizeof(out.timestampUtc));
+      WiFi.disconnect(true, true);
+    }
+  }
+
+  // Power down
+  scdStop();
+  delay(5);
+  digitalWrite(ESP_PWR_3V3, LOW);
+
+  return ok;
+}
+
 
 // ================== ARDUINO ======================
 void setup() {
@@ -1834,7 +2381,6 @@ void setup() {
     LOG("[Setup] Starting measurement\n");
 
     digitalWrite(ESP_PWR_3V3, HIGH);
-    // LOG("[PWR] Sensor rail ON\n");
     delay(250);
 
     // SCD4x / ADS
@@ -1919,12 +2465,13 @@ void setup() {
     scdStop();
     delay(5);
     digitalWrite(ESP_PWR_3V3, LOW);
-    // LOG("[PWR] Sensor rail OFF\n");
 
     haveSample = true;
   } else {
     LOG("[Setup] Skipping measurement this wake (BLE-only interval)\n");
   }
+
+  (void)haveSample;
 
   // ---- Runtime BLE window / session (only if enabled) ----
   RunRuntimeBleWindowOrSession();
